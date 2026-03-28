@@ -18,6 +18,7 @@ Core product behavior:
 - Always study the codebase before making changes.
 - Never guess about existing behavior, architecture, or intent. Read the relevant code first.
 - If the codebase and docs are insufficient to make a safe decision, ask the user for clarification.
+- After making code changes, restart the Atlas2 process and verify it is running before handoff. Do not assume the bot is still up.
 - Avoid emojis.
 - Avoid adding documentation files unless truly necessary. Prefer updating existing docs first.
 - If project structure or ownership changes, update `/docs/ARCHITECTURE.md` and any relevant existing docs.
@@ -133,3 +134,4 @@ Before handing off a change, verify:
 6. Relevant tests were added or updated.
 7. Relevant docs were updated if needed.
 8. No unnecessary files or abstractions were introduced.
+9. The Atlas2 process was restarted after the change and verified to be running.

@@ -38,6 +38,12 @@ pub struct WorkspacePath(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexThreadId(pub String);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptMode {
+    Normal,
+    Plan,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatBinding {
     pub chat_id: TelegramChatId,

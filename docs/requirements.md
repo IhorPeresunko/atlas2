@@ -14,6 +14,7 @@
 - `/start` and `/help` show available commands.
 - `/new` starts a folder-selection flow inside the current group.
 - `/sessions` lists all known sessions globally, including the group and workspace bound to each.
+- `/plan <prompt>` runs a plan-only Codex turn for the current session.
 - Any non-command text in a group with an active session is treated as a prompt for Codex.
 
 ## Folder Selection
@@ -33,6 +34,7 @@
 - A fresh session starts on the first prompt after `/new`.
 - Follow-up prompts resume the stored Codex thread using `codex exec resume <thread_id>`.
 - Codex runs with the selected workspace as its working directory.
+- Plan-mode turns must always be available through Telegram and must be routed as read-only planning requests rather than normal execution turns.
 - Session metadata must persist across restarts in SQLite.
 - Session isolation must be preserved across groups.
 - Prompts for the same group must be serialized so overlapping turns do not corrupt session state.
@@ -40,9 +42,8 @@
 ## Telegram Output and Status
 
 - Codex output should be streamed back into Telegram as the turn progresses.
-- In groups, streaming is implemented by editing a live bot message.
-- Telegram `sendMessageDraft` may be used only where the Bot API allows it; current group behavior relies on message edits.
-- Progress updates, command execution output, and agent text should be reflected in the live message.
+- Each streamed Codex chunk should be sent as its own Telegram message in arrival order.
+- Progress updates, command execution output, and agent text should each be reflected as separate Telegram messages.
 - Approval requests should be posted as separate messages with inline buttons.
 
 ## Approval Flow
@@ -56,8 +57,9 @@
 ## Runtime and Distribution
 
 - Atlas2 should run as a normal local binary on a VM or workstation.
-- On startup, Atlas2 should prompt interactively for the Telegram bot token if it is not already present in the process environment.
-- The prompted bot token should stay in process memory and does not need to be written to `.env`.
+- On startup, Atlas2 should load the Telegram bot token from the process environment when available.
+- If the token is not already present in the process environment, Atlas2 should load it from a local persisted token file when available.
+- If no token is available from either source, Atlas2 should prompt once, keep the token in memory for the running process, and persist it to a local token file for later restarts.
 - Atlas2 should not depend on Docker or Docker Compose for normal use.
 - SQLite is the default persistence backend for a shareable single-instance build.
 - The local machine must already have `codex` installed and authenticated.

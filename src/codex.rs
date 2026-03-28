@@ -7,7 +7,7 @@ use tokio::{
 };
 
 use crate::{
-    domain::{ApprovalId, CodexThreadId},
+    domain::{ApprovalId, CodexThreadId, PromptMode},
     error::{AppError, AppResult},
 };
 
@@ -30,6 +30,7 @@ impl CodexClient {
         workspace_path: &str,
         thread_id: Option<&CodexThreadId>,
         prompt: &str,
+        mode: PromptMode,
         mut on_event: F,
     ) -> AppResult<CodexTurnResult>
     where
@@ -42,6 +43,10 @@ impl CodexClient {
             .arg("--skip-git-repo-check")
             .arg("--cd")
             .arg(workspace_path);
+
+        if mode == PromptMode::Plan {
+            command.arg("--sandbox").arg("read-only");
+        }
 
         for dir in &self.additional_dirs {
             command.arg("--add-dir").arg(dir);
