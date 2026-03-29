@@ -29,6 +29,7 @@ Atlas2 is a single-process Rust service that connects Telegram groups to Codex C
    - stop a live Codex turn
    - download and transcribe voice prompts before routing them through the normal prompt path
    - resolve approval actions
+   - resolve plan-mode interactive choice prompts
 5. The filesystem service validates and canonicalizes workspace paths before session creation.
 6. The Telegram adapter fetches file metadata and downloads voice-note payloads when a Telegram `voice` message is received.
 7. The STT adapter uploads the audio payload to ElevenLabs and returns a transcript string.
@@ -40,6 +41,8 @@ Atlas2 is a single-process Rust service that connects Telegram groups to Codex C
    - command completion messages rendered with Telegram expandable formatting for large output
    - turn control messages with an inline Stop button while a turn is active
    - approval messages with inline buttons
+   - plan-mode multiple-choice questions with inline buttons
+   - proposed-plan follow-up messages with `Implement` and `Add details` buttons
 10. SQLite persists enough state for restart recovery.
 
 ## Subsystems
@@ -73,6 +76,8 @@ SQLite currently stores:
   - Current directory being browsed for each chat during `/new`
 - pending_approvals
   - Approval payload, summary, status, and resolver metadata
+- pending_user_inputs
+  - Interactive question payloads, selected answers, status, and resolver metadata
 
 ## Telegram Interaction Model
 
@@ -86,6 +91,8 @@ SQLite currently stores:
 - Command completions are posted as formatted Telegram messages with the command summary visible and command output collapsed by default.
 - Each live turn also gets a separate control message with a `Stop` button. When the turn finishes or is interrupted, Atlas2 edits that control message into a terminal status and removes the button.
 - Approval requests are posted as separate messages with inline buttons.
+- Option-based `request_user_input` prompts are rendered as sequential Telegram button messages; each click records one answer and advances to the next question until the full response is sent back to Codex.
+- After a plan-mode turn produces a complete proposed plan, Atlas2 posts follow-up buttons. `Implement` starts a normal execution turn using a synthetic implementation prompt from the saved plan, while `Add details` treats the next plain Telegram message as plan refinement input.
 - Only Telegram group admins may create sessions, resolve approvals, or stop a running turn.
 
 ## Codex Integration Model
@@ -102,6 +109,8 @@ SQLite currently stores:
   - agent message deltas
   - command execution started/completed and output deltas
   - approval requests with in-process approve/reject continuation
+  - interactive user-input prompts with in-process answer continuation
+  - completed plan artifacts that Atlas2 can turn into follow-up implementation/refinement actions
 
 ## Constraints and Known Limits
 

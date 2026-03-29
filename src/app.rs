@@ -1,10 +1,13 @@
 use crate::{
     codex::CodexClient,
     config::{CliArgs, Config},
-    domain::{ApprovalId, TelegramChatId, TelegramUserId},
+    domain::{ApprovalId, PlanFollowUpId, TelegramChatId, TelegramUserId, UserInputRequestId},
     error::{AppError, AppResult},
     filesystem::FilesystemService,
-    services::{AppServices, FolderCallbackResult},
+    services::{
+        AppServices, FolderCallbackResult, PlanFollowUpCallbackResult, UserInputCallbackResult,
+        UserInputTextResult,
+    },
     storage::Storage,
     stt::SttClient,
     telegram::TelegramClient,
@@ -70,6 +73,47 @@ impl App {
                 .ok_or_else(|| AppError::Validation("message missing sender".into()))?;
 
             if let Some(text) = message.text.clone() {
+                if !text.starts_with('/') {
+                    if let Some(result) = self
+                        .services
+                        .consume_user_input_text(chat_id, user_id, &text)
+                        .await?
+                    {
+                        match result {
+                            UserInputTextResult::Render(text, markup) => {
+                                self.services
+                                    .telegram
+                                    .send_message(chat_id, &text, None, Some(markup))
+                                    .await?;
+                            }
+                            UserInputTextResult::Replace(summary) => {
+                                self.services
+                                    .telegram
+                                    .send_message(chat_id, &summary, None, None)
+                                    .await?;
+                            }
+                        }
+                        return Ok(());
+                    }
+                    if let Some(prompt) = self.services.consume_plan_refinement(chat_id, &text).await? {
+                        let services = self.services.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = services.run_plan_prompt(chat_id, &prompt).await {
+                                let _ = services
+                                    .telegram
+                                    .send_message(
+                                        chat_id,
+                                        &format!("Prompt failed: {error}"),
+                                        None,
+                                        None,
+                                    )
+                                    .await;
+                            }
+                        });
+                        return Ok(());
+                    }
+                }
+
                 match parse_message_text(&text) {
                     IncomingMessage::Help => {
                         self.services
@@ -201,6 +245,125 @@ impl App {
                         AppError::Validation(format!("invalid session ID in callback: {error}"))
                     })?);
                 self.services.stop_turn(session_id, chat_id, user_id).await
+            } else if let Some(rest) = data.strip_prefix("user-input-answer:") {
+                let mut parts = rest.split(':');
+                let request_id = parts
+                    .next()
+                    .ok_or_else(|| AppError::Validation("missing user input request ID".into()))
+                    .and_then(|id| {
+                        uuid::Uuid::parse_str(id).map(UserInputRequestId).map_err(|error| {
+                            AppError::Validation(format!(
+                                "invalid user input request ID in callback: {error}"
+                            ))
+                        })
+                    })?;
+                let question_index = parts
+                    .next()
+                    .ok_or_else(|| AppError::Validation("missing question index".into()))?
+                    .parse::<usize>()
+                    .map_err(|error| {
+                        AppError::Validation(format!(
+                            "invalid user input question index in callback: {error}"
+                        ))
+                    })?;
+                let option_index = parts
+                    .next()
+                    .ok_or_else(|| AppError::Validation("missing option index".into()))?
+                    .parse::<usize>()
+                    .map_err(|error| {
+                        AppError::Validation(format!(
+                            "invalid user input option index in callback: {error}"
+                        ))
+                    })?;
+
+                match self
+                    .services
+                    .resolve_user_input_choice(
+                        request_id,
+                        chat_id,
+                        user_id,
+                        question_index,
+                        option_index,
+                    )
+                    .await?
+                {
+                    UserInputCallbackResult::Render(text, markup) => {
+                        self.services
+                            .telegram
+                            .edit_message_text(
+                                chat_id,
+                                message.message_id,
+                                &text,
+                                None,
+                                Some(markup),
+                            )
+                            .await?;
+                        Ok("Choice sent.".into())
+                    }
+                    UserInputCallbackResult::Replace(text) => {
+                        self.services
+                            .telegram
+                            .edit_message_text(chat_id, message.message_id, &text, None, None)
+                            .await?;
+                        Ok("Choice sent to Codex.".into())
+                    }
+                }
+            } else if let Some(id) = data.strip_prefix("plan-implement:") {
+                let follow_up_id = PlanFollowUpId(uuid::Uuid::parse_str(id).map_err(|error| {
+                    AppError::Validation(format!("invalid plan follow-up ID in callback: {error}"))
+                })?);
+                match self
+                    .services
+                    .resolve_plan_follow_up_implement(follow_up_id, chat_id, user_id)
+                    .await?
+                {
+                    PlanFollowUpCallbackResult::Replace(text) => {
+                        self.services
+                            .telegram
+                            .edit_message_text(chat_id, message.message_id, &text, None, None)
+                            .await?;
+                        Ok(text)
+                    }
+                    PlanFollowUpCallbackResult::Implement { text, prompt } => {
+                        self.services
+                            .telegram
+                            .edit_message_text(chat_id, message.message_id, &text, None, None)
+                            .await?;
+                        let services = self.services.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = services.run_prompt(chat_id, &prompt).await {
+                                let _ = services
+                                    .telegram
+                                    .send_message(
+                                        chat_id,
+                                        &format!("Prompt failed: {error}"),
+                                        None,
+                                        None,
+                                    )
+                                    .await;
+                            }
+                        });
+                        Ok("Starting plan implementation.".into())
+                    }
+                }
+            } else if let Some(id) = data.strip_prefix("plan-refine:") {
+                let follow_up_id = PlanFollowUpId(uuid::Uuid::parse_str(id).map_err(|error| {
+                    AppError::Validation(format!("invalid plan follow-up ID in callback: {error}"))
+                })?);
+                match self
+                    .services
+                    .resolve_plan_follow_up_refine(follow_up_id, chat_id, user_id)
+                    .await?
+                {
+                    PlanFollowUpCallbackResult::Replace(text) => {
+                        self.services
+                            .telegram
+                            .edit_message_text(chat_id, message.message_id, &text, None, None)
+                            .await?;
+                        Ok("Plan refinement enabled.".into())
+                    }
+                    PlanFollowUpCallbackResult::Implement { .. } => unreachable!(),
+                }
             } else {
                 match self
                     .services

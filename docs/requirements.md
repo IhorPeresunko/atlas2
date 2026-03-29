@@ -38,6 +38,7 @@
 - New Atlas2 sessions should use `codex app-server --session-source cli` so Telegram-originated work is resumable from normal Codex CLI history.
 - Codex runs with the selected workspace as its working directory.
 - Plan-mode turns must always be available through Telegram and must be routed as read-only planning requests rather than normal execution turns.
+- When a plan-mode turn finishes with a complete proposed plan, Telegram must offer follow-up actions to implement the plan or refine it.
 - Session metadata must persist across restarts in SQLite.
 - Session isolation must be preserved across groups.
 - Prompts for the same group must be serialized so overlapping turns do not corrupt session state.
@@ -53,10 +54,13 @@
 ## Approval Flow
 
 - Atlas2 should surface Codex approval/action requests as Telegram buttons whenever the Codex event stream exposes them.
+- Atlas2 should surface option-based `request_user_input` prompts, including plan-mode follow-up choices, as Telegram buttons whenever the Codex event stream exposes them.
+- Atlas2 should also surface completed plan follow-up actions as Telegram buttons even when Codex presents them only as plan output rather than an interactive request.
 - Group admins can approve or reject via Telegram buttons.
 - Group admins can also stop a running turn via Telegram buttons.
 - Approval decisions must be persisted in SQLite.
 - Invalid, stale, or repeated approval clicks must be rejected safely.
+- Invalid, stale, or repeated interactive-choice clicks must be rejected safely.
 - Approval decisions should continue the live app-server turn when the runtime is still active.
 - After an Atlas2 restart, previously pending approval buttons may become stale and must be rejected safely.
 - After a live turn is stopped, approval buttons from that turn must become stale and be rejected safely.

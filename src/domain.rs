@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TelegramChatId(pub i64);
@@ -27,6 +28,24 @@ impl Default for SessionId {
 pub struct ApprovalId(pub Uuid);
 
 impl ApprovalId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct UserInputRequestId(pub Uuid);
+
+impl UserInputRequestId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PlanFollowUpId(pub Uuid);
+
+impl PlanFollowUpId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -94,6 +113,7 @@ pub enum SessionStatus {
     Ready,
     Running,
     WaitingForApproval,
+    WaitingForInput,
     Failed,
 }
 
@@ -103,6 +123,7 @@ impl SessionStatus {
             SessionStatus::Ready => "ready",
             SessionStatus::Running => "running",
             SessionStatus::WaitingForApproval => "waiting_for_approval",
+            SessionStatus::WaitingForInput => "waiting_for_input",
             SessionStatus::Failed => "failed",
         }
     }
@@ -112,6 +133,7 @@ impl SessionStatus {
             "ready" => Some(Self::Ready),
             "running" => Some(Self::Running),
             "waiting_for_approval" => Some(Self::WaitingForApproval),
+            "waiting_for_input" => Some(Self::WaitingForInput),
             "failed" => Some(Self::Failed),
             _ => None,
         }
@@ -153,6 +175,112 @@ impl ApprovalStatus {
             "pending" => Some(Self::Pending),
             "approved" => Some(Self::Approved),
             "rejected" => Some(Self::Rejected),
+            "expired" => Some(Self::Expired),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserInputQuestion {
+    pub id: String,
+    #[serde(default)]
+    pub header: String,
+    pub question: String,
+    #[serde(default, rename = "isOther")]
+    pub is_other: bool,
+    #[serde(default, rename = "isSecret")]
+    pub is_secret: bool,
+    #[serde(default)]
+    pub options: Option<Vec<UserInputOption>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserInputOption {
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserInputAnswer {
+    pub answers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUserInput {
+    pub request_id: UserInputRequestId,
+    pub session_id: SessionId,
+    pub chat_id: TelegramChatId,
+    pub questions: Vec<UserInputQuestion>,
+    pub answers: HashMap<String, UserInputAnswer>,
+    pub status: UserInputStatus,
+    pub created_at: DateTime<Utc>,
+    pub resolved_by: Option<TelegramUserId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserInputStatus {
+    Pending,
+    Answered,
+    Expired,
+}
+
+impl UserInputStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UserInputStatus::Pending => "pending",
+            UserInputStatus::Answered => "answered",
+            UserInputStatus::Expired => "expired",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "answered" => Some(Self::Answered),
+            "expired" => Some(Self::Expired),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPlanFollowUp {
+    pub follow_up_id: PlanFollowUpId,
+    pub session_id: SessionId,
+    pub chat_id: TelegramChatId,
+    pub plan_markdown: String,
+    pub status: PlanFollowUpStatus,
+    pub created_at: DateTime<Utc>,
+    pub resolved_by: Option<TelegramUserId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanFollowUpStatus {
+    Pending,
+    AwaitingRefinement,
+    Implemented,
+    Refined,
+    Expired,
+}
+
+impl PlanFollowUpStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PlanFollowUpStatus::Pending => "pending",
+            PlanFollowUpStatus::AwaitingRefinement => "awaiting_refinement",
+            PlanFollowUpStatus::Implemented => "implemented",
+            PlanFollowUpStatus::Refined => "refined",
+            PlanFollowUpStatus::Expired => "expired",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "awaiting_refinement" => Some(Self::AwaitingRefinement),
+            "implemented" => Some(Self::Implemented),
+            "refined" => Some(Self::Refined),
             "expired" => Some(Self::Expired),
             _ => None,
         }

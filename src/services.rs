@@ -11,8 +11,10 @@ use crate::{
     codex::{CodexClient, CodexEvent},
     config::Config,
     domain::{
-        ApprovalId, ApprovalStatus, FolderBrowseState, PendingApproval, PromptMode, SessionBackend,
-        SessionId, SessionRecord, SessionStatus, TelegramChatId, TelegramUserId, WorkspacePath,
+        ApprovalId, ApprovalStatus, FolderBrowseState, PendingApproval, PendingPlanFollowUp,
+        PendingUserInput, PlanFollowUpId, PlanFollowUpStatus, PromptMode, SessionBackend,
+        SessionId, SessionRecord, SessionStatus, TelegramChatId, TelegramUserId,
+        UserInputAnswer, UserInputOption, UserInputRequestId, UserInputStatus, WorkspacePath,
     },
     error::{AppError, AppResult},
     filesystem::FilesystemService,
@@ -334,6 +336,198 @@ impl AppServices {
         })
     }
 
+    pub async fn resolve_user_input_choice(
+        &self,
+        request_id: UserInputRequestId,
+        chat_id: TelegramChatId,
+        user_id: TelegramUserId,
+        question_index: usize,
+        option_index: usize,
+    ) -> AppResult<UserInputCallbackResult> {
+        self.require_group_admin(chat_id, user_id).await?;
+
+        let request = self
+            .storage
+            .get_pending_user_input(&request_id)
+            .await?
+            .ok_or_else(|| AppError::Validation("user input request not found".into()))?;
+
+        if request.chat_id != chat_id {
+            return Err(AppError::Validation(
+                "user input request belongs to a different chat".into(),
+            ));
+        }
+        if request.status != UserInputStatus::Pending {
+            let message = if request.status == UserInputStatus::Expired {
+                "user input request is no longer active"
+            } else {
+                "user input request has already been answered"
+            };
+            return Err(AppError::Validation(message.into()));
+        }
+
+        let answered_count = request.answers.len();
+        if question_index != answered_count {
+            return Err(AppError::Validation(
+                "this question is no longer awaiting an answer".into(),
+            ));
+        }
+
+        let question = request
+            .questions
+            .get(question_index)
+            .ok_or_else(|| AppError::Validation("invalid question index".into()))?;
+        let option = question
+            .options
+            .as_ref()
+            .and_then(|options| options.get(option_index))
+            .ok_or_else(|| AppError::Validation("invalid option index".into()))?;
+        let answer = option.label.clone();
+
+        match self
+            .apply_user_input_answer(request, user_id, answer)
+            .await?
+        {
+            UserInputAdvance::NextQuestion { text, markup } => {
+                Ok(UserInputCallbackResult::Render(text, markup))
+            }
+            UserInputAdvance::Completed { summary } => Ok(UserInputCallbackResult::Replace(summary)),
+        }
+    }
+
+    pub async fn consume_user_input_text(
+        &self,
+        chat_id: TelegramChatId,
+        user_id: TelegramUserId,
+        text: &str,
+    ) -> AppResult<Option<UserInputTextResult>> {
+        self.require_group_admin(chat_id, user_id).await?;
+
+        let request = match self.storage.get_pending_user_input_for_chat(chat_id).await? {
+            Some(request) => request,
+            None => return Ok(None),
+        };
+
+        if request.status != UserInputStatus::Pending {
+            return Ok(None);
+        }
+
+        let answer = text.trim();
+        if answer.is_empty() {
+            return Ok(None);
+        }
+
+        let result = self
+            .apply_user_input_answer(request, user_id, answer.to_string())
+            .await?;
+        Ok(Some(match result {
+            UserInputAdvance::NextQuestion { text, markup } => {
+                UserInputTextResult::Render(text, markup)
+            }
+            UserInputAdvance::Completed { summary } => UserInputTextResult::Replace(summary),
+        }))
+    }
+
+    pub async fn resolve_plan_follow_up_implement(
+        &self,
+        follow_up_id: PlanFollowUpId,
+        chat_id: TelegramChatId,
+        user_id: TelegramUserId,
+    ) -> AppResult<PlanFollowUpCallbackResult> {
+        self.require_group_admin(chat_id, user_id).await?;
+
+        let follow_up = self
+            .storage
+            .get_pending_plan_follow_up(&follow_up_id)
+            .await?
+            .ok_or_else(|| AppError::Validation("plan follow-up not found".into()))?;
+
+        if follow_up.chat_id != chat_id {
+            return Err(AppError::Validation(
+                "plan follow-up belongs to a different chat".into(),
+            ));
+        }
+        if follow_up.status != PlanFollowUpStatus::Pending {
+            return Err(AppError::Validation(
+                "plan follow-up is no longer active".into(),
+            ));
+        }
+
+        self.storage
+            .resolve_pending_plan_follow_up(
+                &follow_up_id,
+                PlanFollowUpStatus::Implemented,
+                Some(user_id),
+            )
+            .await?;
+
+        Ok(PlanFollowUpCallbackResult::Implement {
+            text: "Starting plan implementation.".into(),
+            prompt: build_plan_implementation_prompt(&follow_up.plan_markdown),
+        })
+    }
+
+    pub async fn resolve_plan_follow_up_refine(
+        &self,
+        follow_up_id: PlanFollowUpId,
+        chat_id: TelegramChatId,
+        user_id: TelegramUserId,
+    ) -> AppResult<PlanFollowUpCallbackResult> {
+        self.require_group_admin(chat_id, user_id).await?;
+
+        let follow_up = self
+            .storage
+            .get_pending_plan_follow_up(&follow_up_id)
+            .await?
+            .ok_or_else(|| AppError::Validation("plan follow-up not found".into()))?;
+
+        if follow_up.chat_id != chat_id {
+            return Err(AppError::Validation(
+                "plan follow-up belongs to a different chat".into(),
+            ));
+        }
+        if follow_up.status != PlanFollowUpStatus::Pending {
+            return Err(AppError::Validation(
+                "plan follow-up is no longer active".into(),
+            ));
+        }
+
+        self.storage
+            .resolve_pending_plan_follow_up(
+                &follow_up_id,
+                PlanFollowUpStatus::AwaitingRefinement,
+                Some(user_id),
+            )
+            .await?;
+
+        Ok(PlanFollowUpCallbackResult::Replace(
+            "Send your next message with feedback to refine the plan.".into(),
+        ))
+    }
+
+    pub async fn consume_plan_refinement(
+        &self,
+        chat_id: TelegramChatId,
+        text: &str,
+    ) -> AppResult<Option<String>> {
+        let Some(follow_up) = self
+            .storage
+            .get_awaiting_plan_follow_up_for_chat(chat_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        self.storage
+            .resolve_pending_plan_follow_up(
+                &follow_up.follow_up_id,
+                PlanFollowUpStatus::Refined,
+                None,
+            )
+            .await?;
+        Ok(Some(text.to_string()))
+    }
+
     pub async fn run_prompt(&self, chat_id: TelegramChatId, prompt: &str) -> AppResult<()> {
         self.run_prompt_with_mode(chat_id, prompt, PromptMode::Normal)
             .await
@@ -380,6 +574,9 @@ impl AppServices {
 
         self.storage
             .expire_pending_approvals_for_session(&session_id)
+            .await?;
+        self.storage
+            .expire_pending_user_inputs_for_session(&session_id)
             .await?;
 
         Ok("Stopping Codex turn.".into())
@@ -568,6 +765,72 @@ impl AppServices {
                             });
                         });
                     }
+                    CodexEvent::UserInputRequested { request } => {
+                        let storage = storage.clone();
+                        let session_id = session_id.clone();
+                        let telegram_updates_tx = event_updates_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = storage
+                                .update_session_status(
+                                    &session_id,
+                                    SessionStatus::WaitingForInput,
+                                    None,
+                                )
+                                .await;
+                            let pending = PendingUserInput {
+                                request_id: request.request_id.clone(),
+                                session_id,
+                                chat_id: chat_id_copy,
+                                questions: request.questions,
+                                answers: HashMap::new(),
+                                status: UserInputStatus::Pending,
+                                created_at: Utc::now(),
+                                resolved_by: None,
+                            };
+                            let _ = storage.insert_pending_user_input(&pending).await;
+                            if let Ok(markup) = user_input_markup(&pending) {
+                                let _ = telegram_updates_tx.send(TelegramTurnUpdate::UserInput {
+                                    text: render_user_input_prompt(&pending),
+                                    markup,
+                                });
+                            }
+                        });
+                    }
+                    CodexEvent::PlanCompleted { markdown } => {
+                        if mode != PromptMode::Plan {
+                            send_text_update(&event_updates_tx, markdown);
+                            return Ok(());
+                        }
+                        let storage = storage.clone();
+                        let session_id = session_id.clone();
+                        let telegram_updates_tx = event_updates_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = storage
+                                .expire_pending_plan_follow_ups_for_session(&session_id)
+                                .await;
+                            let follow_up = PendingPlanFollowUp {
+                                follow_up_id: PlanFollowUpId::new(),
+                                session_id,
+                                chat_id: chat_id_copy,
+                                plan_markdown: markdown.clone(),
+                                status: PlanFollowUpStatus::Pending,
+                                created_at: Utc::now(),
+                                resolved_by: None,
+                            };
+                            let _ = storage.insert_pending_plan_follow_up(&follow_up).await;
+                            let _ = telegram_updates_tx.send(TelegramTurnUpdate::Message(
+                                TelegramMessage {
+                                    text: markdown,
+                                    parse_mode: None,
+                                },
+                            ));
+                            let _ = telegram_updates_tx.send(TelegramTurnUpdate::PlanFollowUp {
+                                text: "Plan ready. Implement it now or send more details to refine it."
+                                    .into(),
+                                markup: plan_follow_up_markup(&follow_up),
+                            });
+                        });
+                    }
                     CodexEvent::TurnCompleted => {}
                     CodexEvent::TurnInterrupted { message } => {
                         let _ = message;
@@ -701,9 +964,86 @@ impl AppServices {
     }
 }
 
+enum UserInputAdvance {
+    NextQuestion {
+        text: String,
+        markup: InlineKeyboardMarkup,
+    },
+    Completed {
+        summary: String,
+    },
+}
+
+impl AppServices {
+    async fn apply_user_input_answer(
+        &self,
+        mut request: PendingUserInput,
+        user_id: TelegramUserId,
+        answer: String,
+    ) -> AppResult<UserInputAdvance> {
+        let question_index = request.answers.len();
+        let question = request
+            .questions
+            .get(question_index)
+            .ok_or_else(|| AppError::Validation("no pending question remains".into()))?;
+
+        request.answers.insert(
+            question.id.clone(),
+            UserInputAnswer {
+                answers: vec![answer],
+            },
+        );
+        let answers_json = serde_json::to_string(&request.answers)?;
+
+        if request.answers.len() < request.questions.len() {
+            self.storage
+                .update_pending_user_input_answers(&request.request_id, &answers_json)
+                .await?;
+            return Ok(UserInputAdvance::NextQuestion {
+                text: render_user_input_prompt(&request),
+                markup: user_input_markup(&request)?,
+            });
+        }
+
+        self.codex
+            .resolve_user_input(&request.session_id, &request.request_id, request.answers.clone())
+            .await?;
+        self.storage
+            .resolve_pending_user_input(
+                &request.request_id,
+                UserInputStatus::Answered,
+                user_id,
+                &answers_json,
+            )
+            .await?;
+        self.storage
+            .update_session_status(&request.session_id, SessionStatus::Running, None)
+            .await?;
+
+        Ok(UserInputAdvance::Completed {
+            summary: render_user_input_summary(&request),
+        })
+    }
+}
+
 pub enum FolderCallbackResult {
     Render(String, InlineKeyboardMarkup),
     Replace(String),
+}
+
+pub enum UserInputCallbackResult {
+    Render(String, InlineKeyboardMarkup),
+    Replace(String),
+}
+
+pub enum UserInputTextResult {
+    Render(String, InlineKeyboardMarkup),
+    Replace(String),
+}
+
+pub enum PlanFollowUpCallbackResult {
+    Replace(String),
+    Implement { text: String, prompt: String },
 }
 
 fn trim_for_telegram(text: &str) -> String {
@@ -713,6 +1053,105 @@ fn trim_for_telegram(text: &str) -> String {
     } else {
         trimmed
     }
+}
+
+fn user_input_markup(request: &PendingUserInput) -> AppResult<InlineKeyboardMarkup> {
+    let question_index = request.answers.len();
+    let question = request
+        .questions
+        .get(question_index)
+        .ok_or_else(|| AppError::Validation("no pending question remains".into()))?;
+    let options = question
+        .options
+        .as_ref()
+        .ok_or_else(|| AppError::Validation("question has no selectable options".into()))?;
+
+    let buttons = options
+        .iter()
+        .enumerate()
+        .map(|(option_index, option)| {
+            vec![button(
+                &option.label,
+                format!(
+                    "user-input-answer:{}:{}:{}",
+                    request.request_id.0, question_index, option_index
+                ),
+            )]
+        })
+        .collect();
+    Ok(InlineKeyboardMarkup {
+        inline_keyboard: buttons,
+    })
+}
+
+fn render_user_input_prompt(request: &PendingUserInput) -> String {
+    let question_index = request.answers.len();
+    let question = &request.questions[question_index];
+
+    let mut lines = vec![format!(
+        "Codex needs your input ({}/{})",
+        question_index + 1,
+        request.questions.len()
+    )];
+    if !question.header.is_empty() {
+        lines.push(question.header.clone());
+    }
+    lines.push(question.question.clone());
+    lines.push("Reply with a button tap or send a text answer.".into());
+
+    if !request.answers.is_empty() {
+        lines.push(String::new());
+        lines.push("Answered so far:".into());
+        for answered_question in request.questions.iter().take(question_index) {
+            if let Some(answer) = request.answers.get(&answered_question.id) {
+                let value = answer.answers.join(", ");
+                lines.push(format!("- {}: {}", answered_question.header, value));
+            }
+        }
+    }
+
+    if let Some(options) = question.options.as_ref() {
+        lines.push(String::new());
+        lines.push("Options:".into());
+        for UserInputOption { label, description } in options {
+            lines.push(format!("- {}: {}", label, description));
+        }
+    }
+
+    trim_for_telegram(&lines.join("\n"))
+}
+
+fn render_user_input_summary(request: &PendingUserInput) -> String {
+    let mut lines = vec!["Sent your response to Codex.".into()];
+    for question in &request.questions {
+        if let Some(answer) = request.answers.get(&question.id) {
+            lines.push(format!(
+                "- {}: {}",
+                question.header,
+                answer.answers.join(", ")
+            ));
+        }
+    }
+    trim_for_telegram(&lines.join("\n"))
+}
+
+fn plan_follow_up_markup(follow_up: &PendingPlanFollowUp) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![vec![
+            button(
+                "Implement",
+                format!("plan-implement:{}", follow_up.follow_up_id.0),
+            ),
+            button(
+                "Add details",
+                format!("plan-refine:{}", follow_up.follow_up_id.0),
+            ),
+        ]],
+    }
+}
+
+fn build_plan_implementation_prompt(plan_markdown: &str) -> String {
+    format!("PLEASE IMPLEMENT THIS PLAN:\n{}", plan_markdown.trim())
 }
 
 fn turn_control_markup(session_id: &SessionId) -> InlineKeyboardMarkup {
@@ -742,6 +1181,14 @@ enum TelegramTurnUpdate {
         summary: String,
         markup: InlineKeyboardMarkup,
     },
+    PlanFollowUp {
+        text: String,
+        markup: InlineKeyboardMarkup,
+    },
+    UserInput {
+        text: String,
+        markup: InlineKeyboardMarkup,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -765,7 +1212,27 @@ fn build_codex_prompt(prompt: &str, mode: PromptMode) -> String {
                 "You are in Atlas2 plan mode.\n",
                 "Analyze the request and return a concrete implementation plan only.\n",
                 "Do not modify files, do not apply patches, and do not run write operations.\n",
-                "You may inspect the codebase as needed.\n\n",
+                "You may inspect the codebase and run non-mutating commands as needed.\n",
+                "\n",
+                "Plan mode rules:\n",
+                "- Stay in plan mode until a developer message explicitly ends it.\n",
+                "- If the user asks you to implement while still in plan mode, treat it as a request to plan the implementation.\n",
+                "- Ask follow-up questions when they materially change the plan or confirm an important assumption.\n",
+                "- Strongly prefer the request_user_input tool for those follow-up questions whenever the choice can be expressed with meaningful options.\n",
+                "- Prefer exploring the repository before asking questions that can be answered from local context.\n",
+                "\n",
+                "Finalization rules:\n",
+                "- Only present the final plan when it is decision-complete and leaves no important decisions to the implementer.\n",
+                "- When you present the official plan, wrap it in a <proposed_plan> block exactly like this:\n",
+                "<proposed_plan>\n",
+                "# Plan title\n",
+                "...\n",
+                "</proposed_plan>\n",
+                "- The opening and closing tags must each be on their own line.\n",
+                "- Use Markdown inside the block.\n",
+                "- Output at most one <proposed_plan> block per turn.\n",
+                "- Do not ask \"should I proceed?\" after the final plan.\n",
+                "\n",
                 "User request:\n{}"
             ),
             prompt
@@ -847,6 +1314,18 @@ async fn send_telegram_update(
             clear_status_message(telegram, chat_id, delivery_state).await?;
             telegram
                 .send_message(chat_id, &summary, None, Some(markup))
+                .await?;
+        }
+        TelegramTurnUpdate::PlanFollowUp { text, markup } => {
+            clear_status_message(telegram, chat_id, delivery_state).await?;
+            telegram
+                .send_message(chat_id, &text, None, Some(markup))
+                .await?;
+        }
+        TelegramTurnUpdate::UserInput { text, markup } => {
+            clear_status_message(telegram, chat_id, delivery_state).await?;
+            telegram
+                .send_message(chat_id, &text, None, Some(markup))
                 .await?;
         }
     }
@@ -1035,12 +1514,20 @@ mod tests {
         domain::{PromptMode, SessionId},
         services::{
             TELEGRAM_TEXT_LIMIT, TelegramTurnUpdate, TurnTerminalState, build_codex_prompt,
-            compact_text_for_telegram, render_command_finished_message, render_turn_terminal_text,
-            render_voice_transcript_message, send_clear_status_update, send_status_update,
-            send_text_update, trim_for_telegram, turn_control_markup,
+            build_plan_implementation_prompt, compact_text_for_telegram,
+            plan_follow_up_markup, render_command_finished_message, render_turn_terminal_text,
+            render_user_input_prompt, render_voice_transcript_message, send_clear_status_update,
+            send_status_update, send_text_update, trim_for_telegram, turn_control_markup,
+            user_input_markup,
         },
         telegram::ParseMode,
     };
+    use crate::domain::{
+        PendingPlanFollowUp, PendingUserInput, PlanFollowUpId, PlanFollowUpStatus,
+        TelegramChatId, UserInputOption, UserInputQuestion, UserInputRequestId, UserInputStatus,
+    };
+    use chrono::Utc;
+    use std::collections::HashMap;
     use tokio::sync::mpsc::unbounded_channel;
 
     #[test]
@@ -1216,5 +1703,82 @@ mod tests {
 
         assert!(message.starts_with("Transcribed voice message:\n"));
         assert!(message.contains(".../src/app.rs"));
+    }
+
+    #[test]
+    fn renders_user_input_prompt_and_markup() {
+        let request = PendingUserInput {
+            request_id: UserInputRequestId::new(),
+            session_id: SessionId::new(),
+            chat_id: TelegramChatId(1),
+            questions: vec![
+                UserInputQuestion {
+                    id: "scope".into(),
+                    header: "Scope".into(),
+                    question: "Which path should Atlas2 take?".into(),
+                    is_other: false,
+                    is_secret: false,
+                    options: Some(vec![
+                        UserInputOption {
+                            label: "Implement".into(),
+                            description: "Start the code changes now.".into(),
+                        },
+                        UserInputOption {
+                            label: "More details".into(),
+                            description: "Ask a follow-up question first.".into(),
+                        },
+                    ]),
+                },
+                UserInputQuestion {
+                    id: "risk".into(),
+                    header: "Risk".into(),
+                    question: "How cautious should the rollout be?".into(),
+                    is_other: false,
+                    is_secret: false,
+                    options: Some(vec![UserInputOption {
+                        label: "Conservative".into(),
+                        description: "Keep the first pass narrow.".into(),
+                    }]),
+                },
+            ],
+            answers: HashMap::new(),
+            status: UserInputStatus::Pending,
+            created_at: Utc::now(),
+            resolved_by: None,
+        };
+
+        let text = render_user_input_prompt(&request);
+        let markup = user_input_markup(&request).unwrap();
+
+        assert!(text.contains("Codex needs your input (1/2)"));
+        assert!(text.contains("Reply with a button tap or send a text answer."));
+        assert!(text.contains("Implement: Start the code changes now."));
+        assert_eq!(markup.inline_keyboard.len(), 2);
+        assert!(markup.inline_keyboard[0][0]
+            .callback_data
+            .starts_with("user-input-answer:"));
+    }
+
+    #[test]
+    fn renders_plan_follow_up_markup_and_prompt() {
+        let follow_up = PendingPlanFollowUp {
+            follow_up_id: PlanFollowUpId::new(),
+            session_id: SessionId::new(),
+            chat_id: TelegramChatId(1),
+            plan_markdown: "# Ship it\n\n- one".into(),
+            status: PlanFollowUpStatus::Pending,
+            created_at: Utc::now(),
+            resolved_by: None,
+        };
+
+        let markup = plan_follow_up_markup(&follow_up);
+        let prompt = build_plan_implementation_prompt(&follow_up.plan_markdown);
+
+        assert_eq!(markup.inline_keyboard[0][0].text, "Implement");
+        assert_eq!(markup.inline_keyboard[0][1].text, "Add details");
+        assert!(markup.inline_keyboard[0][0]
+            .callback_data
+            .starts_with("plan-implement:"));
+        assert_eq!(prompt, "PLEASE IMPLEMENT THIS PLAN:\n# Ship it\n\n- one");
     }
 }

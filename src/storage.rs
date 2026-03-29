@@ -4,8 +4,9 @@ use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 use crate::{
     domain::{
         ApprovalId, ApprovalStatus, ChatBinding, CodexThreadId, FolderBrowseState, PendingApproval,
-        SessionBackend, SessionId, SessionRecord, SessionStatus, SessionSummary, TelegramChatId,
-        TelegramUserId, WorkspacePath,
+        PendingPlanFollowUp, PendingUserInput, PlanFollowUpId, PlanFollowUpStatus,
+        SessionBackend, SessionId, SessionRecord, SessionStatus, SessionSummary,
+        TelegramChatId, TelegramUserId, UserInputRequestId, UserInputStatus, WorkspacePath,
     },
     error::{AppError, AppResult},
 };
@@ -61,6 +62,27 @@ impl Storage {
                 chat_id INTEGER NOT NULL,
                 payload TEXT NOT NULL,
                 summary TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                resolved_by INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS pending_user_inputs (
+                request_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                questions_json TEXT NOT NULL,
+                answers_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                resolved_by INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS pending_plan_followups (
+                follow_up_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                plan_markdown TEXT NOT NULL,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 resolved_by INTEGER
@@ -271,7 +293,7 @@ impl Storage {
                 last_error = 'Atlas2 restarted while the app-server runtime was active. Send a new prompt to resume from the last saved thread.',
                 updated_at = ?1
             WHERE backend = 'app_server'
-              AND status IN ('running', 'waiting_for_approval')
+              AND status IN ('running', 'waiting_for_approval', 'waiting_for_input')
             "#,
         )
         .bind(Utc::now().to_rfc3339())
@@ -418,6 +440,227 @@ impl Storage {
         .await?;
         Ok(())
     }
+
+    pub async fn insert_pending_user_input(&self, request: &PendingUserInput) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO pending_user_inputs (
+                request_id, session_id, chat_id, questions_json, answers_json, status, created_at, resolved_by
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+        )
+        .bind(request.request_id.0.to_string())
+        .bind(request.session_id.0.to_string())
+        .bind(request.chat_id.0)
+        .bind(serde_json::to_string(&request.questions)?)
+        .bind(serde_json::to_string(&request.answers)?)
+        .bind(request.status.as_str())
+        .bind(request.created_at.to_rfc3339())
+        .bind(request.resolved_by.map(|user| user.0))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_pending_user_input(
+        &self,
+        request_id: &UserInputRequestId,
+    ) -> AppResult<Option<PendingUserInput>> {
+        let row = sqlx::query(
+            r#"
+            SELECT request_id, session_id, chat_id, questions_json, answers_json, status, created_at, resolved_by
+            FROM pending_user_inputs
+            WHERE request_id = ?1
+            "#,
+        )
+        .bind(request_id.0.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(map_pending_user_input).transpose()
+    }
+
+    pub async fn get_pending_user_input_for_chat(
+        &self,
+        chat_id: TelegramChatId,
+    ) -> AppResult<Option<PendingUserInput>> {
+        let row = sqlx::query(
+            r#"
+            SELECT request_id, session_id, chat_id, questions_json, answers_json, status, created_at, resolved_by
+            FROM pending_user_inputs
+            WHERE chat_id = ?1
+              AND status = 'pending'
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(chat_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(map_pending_user_input).transpose()
+    }
+
+    pub async fn update_pending_user_input_answers(
+        &self,
+        request_id: &UserInputRequestId,
+        answers_json: &str,
+    ) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            UPDATE pending_user_inputs
+            SET answers_json = ?2
+            WHERE request_id = ?1
+            "#,
+        )
+        .bind(request_id.0.to_string())
+        .bind(answers_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn resolve_pending_user_input(
+        &self,
+        request_id: &UserInputRequestId,
+        status: UserInputStatus,
+        resolved_by: TelegramUserId,
+        answers_json: &str,
+    ) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            UPDATE pending_user_inputs
+            SET status = ?2, resolved_by = ?3, answers_json = ?4
+            WHERE request_id = ?1
+            "#,
+        )
+        .bind(request_id.0.to_string())
+        .bind(status.as_str())
+        .bind(resolved_by.0)
+        .bind(answers_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn expire_pending_user_inputs_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            UPDATE pending_user_inputs
+            SET status = 'expired'
+            WHERE session_id = ?1
+              AND status = 'pending'
+            "#,
+        )
+        .bind(session_id.0.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn insert_pending_plan_follow_up(
+        &self,
+        follow_up: &PendingPlanFollowUp,
+    ) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO pending_plan_followups (
+                follow_up_id, session_id, chat_id, plan_markdown, status, created_at, resolved_by
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+        )
+        .bind(follow_up.follow_up_id.0.to_string())
+        .bind(follow_up.session_id.0.to_string())
+        .bind(follow_up.chat_id.0)
+        .bind(&follow_up.plan_markdown)
+        .bind(follow_up.status.as_str())
+        .bind(follow_up.created_at.to_rfc3339())
+        .bind(follow_up.resolved_by.map(|user| user.0))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_pending_plan_follow_up(
+        &self,
+        follow_up_id: &PlanFollowUpId,
+    ) -> AppResult<Option<PendingPlanFollowUp>> {
+        let row = sqlx::query(
+            r#"
+            SELECT follow_up_id, session_id, chat_id, plan_markdown, status, created_at, resolved_by
+            FROM pending_plan_followups
+            WHERE follow_up_id = ?1
+            "#,
+        )
+        .bind(follow_up_id.0.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(map_pending_plan_follow_up).transpose()
+    }
+
+    pub async fn get_awaiting_plan_follow_up_for_chat(
+        &self,
+        chat_id: TelegramChatId,
+    ) -> AppResult<Option<PendingPlanFollowUp>> {
+        let row = sqlx::query(
+            r#"
+            SELECT follow_up_id, session_id, chat_id, plan_markdown, status, created_at, resolved_by
+            FROM pending_plan_followups
+            WHERE chat_id = ?1
+              AND status = 'awaiting_refinement'
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(chat_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(map_pending_plan_follow_up).transpose()
+    }
+
+    pub async fn resolve_pending_plan_follow_up(
+        &self,
+        follow_up_id: &PlanFollowUpId,
+        status: PlanFollowUpStatus,
+        resolved_by: Option<TelegramUserId>,
+    ) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            UPDATE pending_plan_followups
+            SET status = ?2, resolved_by = ?3
+            WHERE follow_up_id = ?1
+            "#,
+        )
+        .bind(follow_up_id.0.to_string())
+        .bind(status.as_str())
+        .bind(resolved_by.map(|user| user.0))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn expire_pending_plan_follow_ups_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            UPDATE pending_plan_followups
+            SET status = 'expired'
+            WHERE session_id = ?1
+              AND status IN ('pending', 'awaiting_refinement')
+            "#,
+        )
+        .bind(session_id.0.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 fn map_chat_binding(row: sqlx::sqlite::SqliteRow) -> AppResult<ChatBinding> {
@@ -490,6 +733,35 @@ fn map_pending_approval(row: sqlx::sqlite::SqliteRow) -> AppResult<PendingApprov
     })
 }
 
+fn map_pending_user_input(row: sqlx::sqlite::SqliteRow) -> AppResult<PendingUserInput> {
+    Ok(PendingUserInput {
+        request_id: UserInputRequestId(parse_uuid(&row.get::<String, _>("request_id"))?),
+        session_id: SessionId(parse_uuid(&row.get::<String, _>("session_id"))?),
+        chat_id: TelegramChatId(row.get::<i64, _>("chat_id")),
+        questions: serde_json::from_str(&row.get::<String, _>("questions_json"))?,
+        answers: serde_json::from_str(&row.get::<String, _>("answers_json"))?,
+        status: UserInputStatus::parse(&row.get::<String, _>("status")).ok_or_else(|| {
+            AppError::Storage(sqlx::Error::Decode("invalid user input status".into()))
+        })?,
+        created_at: parse_datetime(&row.get::<String, _>("created_at"))?,
+        resolved_by: row.get::<Option<i64>, _>("resolved_by").map(TelegramUserId),
+    })
+}
+
+fn map_pending_plan_follow_up(row: sqlx::sqlite::SqliteRow) -> AppResult<PendingPlanFollowUp> {
+    Ok(PendingPlanFollowUp {
+        follow_up_id: PlanFollowUpId(parse_uuid(&row.get::<String, _>("follow_up_id"))?),
+        session_id: SessionId(parse_uuid(&row.get::<String, _>("session_id"))?),
+        chat_id: TelegramChatId(row.get::<i64, _>("chat_id")),
+        plan_markdown: row.get::<String, _>("plan_markdown"),
+        status: PlanFollowUpStatus::parse(&row.get::<String, _>("status")).ok_or_else(|| {
+            AppError::Storage(sqlx::Error::Decode("invalid plan follow-up status".into()))
+        })?,
+        created_at: parse_datetime(&row.get::<String, _>("created_at"))?,
+        resolved_by: row.get::<Option<i64>, _>("resolved_by").map(TelegramUserId),
+    })
+}
+
 fn parse_uuid(value: &str) -> AppResult<uuid::Uuid> {
     uuid::Uuid::parse_str(value)
         .map_err(|error| AppError::Validation(format!("invalid UUID {value}: {error}")))
@@ -507,9 +779,12 @@ mod tests {
 
     use super::Storage;
     use crate::domain::{
-        ApprovalId, ApprovalStatus, ChatBinding, CodexThreadId, PendingApproval, SessionBackend,
-        SessionId, SessionRecord, SessionStatus, TelegramChatId, WorkspacePath,
+        ApprovalId, ApprovalStatus, ChatBinding, CodexThreadId, PendingApproval,
+        PendingPlanFollowUp, PendingUserInput, PlanFollowUpId, PlanFollowUpStatus,
+        SessionBackend, SessionId, SessionRecord, SessionStatus, TelegramChatId, UserInputAnswer,
+        UserInputOption, UserInputQuestion, UserInputRequestId, UserInputStatus, WorkspacePath,
     };
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn stores_and_reads_active_session_binding() {
@@ -630,5 +905,200 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(updated.status, ApprovalStatus::Expired);
+    }
+
+    #[tokio::test]
+    async fn stores_updates_and_expires_pending_user_inputs() {
+        let storage = Storage::connect("sqlite::memory:").await.unwrap();
+        let session = SessionRecord {
+            session_id: SessionId::new(),
+            chat_id: TelegramChatId(15),
+            workspace_path: WorkspacePath("/tmp/project".into()),
+            backend: SessionBackend::AppServer,
+            provider_thread_id: None,
+            resume_cursor_json: None,
+            status: SessionStatus::WaitingForInput,
+            last_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        storage.insert_session(&session).await.unwrap();
+
+        let request = PendingUserInput {
+            request_id: UserInputRequestId::new(),
+            session_id: session.session_id.clone(),
+            chat_id: session.chat_id,
+            questions: vec![UserInputQuestion {
+                id: "next_step".into(),
+                header: "Plan".into(),
+                question: "What next?".into(),
+                is_other: false,
+                is_secret: false,
+                options: Some(vec![UserInputOption {
+                    label: "Implement".into(),
+                    description: "Start implementation".into(),
+                }]),
+            }],
+            answers: HashMap::new(),
+            status: UserInputStatus::Pending,
+            created_at: Utc::now(),
+            resolved_by: None,
+        };
+        storage.insert_pending_user_input(&request).await.unwrap();
+
+        let answers = HashMap::from([(
+            "next_step".to_string(),
+            UserInputAnswer {
+                answers: vec!["Implement".into()],
+            },
+        )]);
+        let answers_json = serde_json::to_string(&answers).unwrap();
+        storage
+            .update_pending_user_input_answers(&request.request_id, &answers_json)
+            .await
+            .unwrap();
+        storage
+            .resolve_pending_user_input(
+                &request.request_id,
+                UserInputStatus::Answered,
+                crate::domain::TelegramUserId(99),
+                &answers_json,
+            )
+            .await
+            .unwrap();
+
+        let updated = storage
+            .get_pending_user_input(&request.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, UserInputStatus::Answered);
+        assert_eq!(
+            updated.answers.get("next_step").unwrap().answers,
+            vec!["Implement".to_string()]
+        );
+
+        storage
+            .expire_pending_user_inputs_for_session(&session.session_id)
+            .await
+            .unwrap();
+        let unchanged = storage
+            .get_pending_user_input(&request.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.status, UserInputStatus::Answered);
+    }
+
+    #[tokio::test]
+    async fn finds_pending_user_input_for_chat() {
+        let storage = Storage::connect("sqlite::memory:").await.unwrap();
+        let session = SessionRecord {
+            session_id: SessionId::new(),
+            chat_id: TelegramChatId(17),
+            workspace_path: WorkspacePath("/tmp/project".into()),
+            backend: SessionBackend::AppServer,
+            provider_thread_id: None,
+            resume_cursor_json: None,
+            status: SessionStatus::WaitingForInput,
+            last_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        storage.insert_session(&session).await.unwrap();
+
+        let request = PendingUserInput {
+            request_id: UserInputRequestId::new(),
+            session_id: session.session_id.clone(),
+            chat_id: session.chat_id,
+            questions: vec![UserInputQuestion {
+                id: "scope".into(),
+                header: "Scope".into(),
+                question: "Choose a scope".into(),
+                is_other: false,
+                is_secret: false,
+                options: Some(vec![UserInputOption {
+                    label: "Small".into(),
+                    description: "Keep it narrow".into(),
+                }]),
+            }],
+            answers: HashMap::new(),
+            status: UserInputStatus::Pending,
+            created_at: Utc::now(),
+            resolved_by: None,
+        };
+        storage.insert_pending_user_input(&request).await.unwrap();
+
+        let found = storage
+            .get_pending_user_input_for_chat(session.chat_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.request_id, request.request_id);
+    }
+
+    #[tokio::test]
+    async fn stores_and_resolves_pending_plan_follow_ups() {
+        let storage = Storage::connect("sqlite::memory:").await.unwrap();
+        let session = SessionRecord {
+            session_id: SessionId::new(),
+            chat_id: TelegramChatId(16),
+            workspace_path: WorkspacePath("/tmp/project".into()),
+            backend: SessionBackend::AppServer,
+            provider_thread_id: None,
+            resume_cursor_json: None,
+            status: SessionStatus::Ready,
+            last_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        storage.insert_session(&session).await.unwrap();
+
+        let follow_up = PendingPlanFollowUp {
+            follow_up_id: PlanFollowUpId::new(),
+            session_id: session.session_id.clone(),
+            chat_id: session.chat_id,
+            plan_markdown: "# Plan\n\n- Step".into(),
+            status: PlanFollowUpStatus::Pending,
+            created_at: Utc::now(),
+            resolved_by: None,
+        };
+        storage
+            .insert_pending_plan_follow_up(&follow_up)
+            .await
+            .unwrap();
+        storage
+            .resolve_pending_plan_follow_up(
+                &follow_up.follow_up_id,
+                PlanFollowUpStatus::AwaitingRefinement,
+                Some(crate::domain::TelegramUserId(7)),
+            )
+            .await
+            .unwrap();
+
+        let updated = storage
+            .get_pending_plan_follow_up(&follow_up.follow_up_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, PlanFollowUpStatus::AwaitingRefinement);
+
+        let awaiting = storage
+            .get_awaiting_plan_follow_up_for_chat(session.chat_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(awaiting.follow_up_id, follow_up.follow_up_id);
+
+        storage
+            .expire_pending_plan_follow_ups_for_session(&session.session_id)
+            .await
+            .unwrap();
+        let expired = storage
+            .get_pending_plan_follow_up(&follow_up.follow_up_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.status, PlanFollowUpStatus::Expired);
     }
 }

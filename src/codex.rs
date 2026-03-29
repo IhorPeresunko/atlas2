@@ -8,6 +8,7 @@ use std::{
     },
 };
 
+use regex::Regex;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -16,9 +17,36 @@ use tokio::{
 };
 
 use crate::{
-    domain::{ApprovalId, CodexThreadId, PromptMode, SessionId, SessionRecord},
+    domain::{
+        ApprovalId, CodexThreadId, PromptMode, SessionId, SessionRecord, UserInputAnswer,
+        UserInputQuestion, UserInputRequestId,
+    },
     error::{AppError, AppResult},
 };
+
+const CODEX_DEFAULT_MODEL: &str = "gpt-5.3-codex";
+const CODEX_DEFAULT_REASONING_EFFORT: &str = "medium";
+const CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS: &str = concat!(
+    "<collaboration_mode># Plan Mode\n\n",
+    "You are in Plan Mode until a developer message explicitly ends it.\n",
+    "If the user asks for implementation while still in Plan Mode, treat it as a request to plan the implementation, not execute it.\n\n",
+    "Rules:\n",
+    "- Explore first. Prefer reading the codebase and running non-mutating checks before asking questions.\n",
+    "- Do not edit files or perform mutating actions.\n",
+    "- Ask follow-up questions when they materially change the plan or confirm an important assumption.\n",
+    "- Strongly prefer the `request_user_input` tool for meaningful multiple-choice decisions.\n",
+    "- Present the final plan only when it is decision-complete.\n",
+    "- Wrap the final plan in a `<proposed_plan>` block on its own lines.\n",
+    "- Do not ask whether to proceed after the final plan.\n",
+    "</collaboration_mode>",
+);
+const CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS: &str = concat!(
+    "<collaboration_mode># Collaboration Mode: Default\n\n",
+    "You are in Default mode.\n",
+    "Make reasonable assumptions and execute the task instead of stopping to ask questions unless a risky ambiguity remains.\n",
+    "The `request_user_input` tool is unavailable in Default mode.\n",
+    "</collaboration_mode>",
+);
 
 #[derive(Debug, Clone)]
 pub struct CodexClient {
@@ -150,6 +178,27 @@ impl CodexClient {
         runtime.resolve_approval(approval_id, approved).await
     }
 
+    pub async fn resolve_user_input(
+        &self,
+        session_id: &SessionId,
+        request_id: &UserInputRequestId,
+        answers: HashMap<String, UserInputAnswer>,
+    ) -> AppResult<()> {
+        let runtime = self
+            .runtimes
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::Validation(
+                    "user input request is stale because the live Codex runtime is no longer active"
+                        .into(),
+                )
+            })?;
+        runtime.resolve_user_input(request_id, answers).await
+    }
+
     pub async fn stop_turn(&self, session_id: &SessionId) -> AppResult<()> {
         let runtime = self
             .runtimes
@@ -194,6 +243,12 @@ pub enum CodexEvent {
     ApprovalRequested {
         approval: CodexPendingApproval,
     },
+    UserInputRequested {
+        request: CodexPendingUserInput,
+    },
+    PlanCompleted {
+        markdown: String,
+    },
     TurnCompleted,
     TurnInterrupted {
         message: String,
@@ -208,6 +263,12 @@ pub struct CodexPendingApproval {
     pub approval_id: ApprovalId,
     pub summary: String,
     pub payload: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexPendingUserInput {
+    pub request_id: UserInputRequestId,
+    pub questions: Vec<UserInputQuestion>,
 }
 
 #[derive(Debug, Clone)]
@@ -285,8 +346,12 @@ impl AppServerRuntime {
         let approvals = Arc::new(Mutex::new(
             HashMap::<ApprovalId, PendingApprovalRequest>::new(),
         ));
+        let user_inputs = Arc::new(Mutex::new(
+            HashMap::<UserInputRequestId, PendingUserInputRequest>::new(),
+        ));
         let handle = Arc::new(LiveRuntimeHandle {
             approvals,
+            user_inputs,
             sender: sender.clone(),
             session_id,
             current_thread_id: Mutex::new(None),
@@ -402,6 +467,8 @@ impl AppServerRuntime {
             params["approvalPolicy"] = json!("on-request");
             params["sandboxPolicy"] = sandbox_policy;
         }
+        params["collaborationMode"] = build_collaboration_mode(mode);
+        params["model"] = json!(CODEX_DEFAULT_MODEL);
 
         self.send_request("turn/start", params).await?;
         Ok(())
@@ -473,6 +540,7 @@ impl AppServerRuntime {
 #[derive(Debug)]
 struct LiveRuntimeHandle {
     approvals: Arc<Mutex<HashMap<ApprovalId, PendingApprovalRequest>>>,
+    user_inputs: Arc<Mutex<HashMap<UserInputRequestId, PendingUserInputRequest>>>,
     sender: mpsc::UnboundedSender<String>,
     session_id: SessionId,
     current_thread_id: Mutex<Option<CodexThreadId>>,
@@ -502,6 +570,35 @@ impl LiveRuntimeHandle {
             .map_err(|_| {
                 AppError::Codex(format!(
                     "failed to send approval decision for session {}",
+                    self.session_id.0
+                ))
+            })
+    }
+
+    async fn resolve_user_input(
+        &self,
+        request_id: &UserInputRequestId,
+        answers: HashMap<String, UserInputAnswer>,
+    ) -> AppResult<()> {
+        let pending = self
+            .user_inputs
+            .lock()
+            .await
+            .remove(request_id)
+            .ok_or_else(|| AppError::Validation("user input request is no longer active".into()))?;
+        self.sender
+            .send(
+                json!({
+                    "id": pending.request_id,
+                    "result": {
+                        "answers": answers
+                    }
+                })
+                .to_string(),
+            )
+            .map_err(|_| {
+                AppError::Codex(format!(
+                    "failed to send user input response for session {}",
                     self.session_id.0
                 ))
             })
@@ -555,6 +652,16 @@ impl LiveRuntimeHandle {
 #[derive(Debug, Clone)]
 struct PendingApprovalRequest {
     request_id: Value,
+}
+
+#[derive(Debug, Clone)]
+struct PendingUserInputRequest {
+    request_id: Value,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ToolRequestUserInputParams {
+    questions: Vec<UserInputQuestion>,
 }
 
 async fn read_stdout_loop(
@@ -690,20 +797,59 @@ async fn handle_server_request(
             true
         }
         "item/tool/requestUserInput" => {
-            let _ = event_tx.send(CodexEvent::Status {
-                text: "Codex requested interactive user input that Atlas2 does not support yet."
-                    .into(),
-            });
-            let _ = handle.sender.send(
-                json!({
-                    "id": request_id,
-                    "error": {
-                        "code": -32601,
-                        "message": "Atlas2 does not support tool user input requests yet."
-                    }
-                })
-                .to_string(),
+            let parsed = match serde_json::from_value::<ToolRequestUserInputParams>(params) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    let _ = event_tx.send(CodexEvent::Status {
+                        text: format!(
+                            "Codex sent an invalid interactive user input request: {error}"
+                        ),
+                    });
+                    let _ = handle.sender.send(
+                        json!({
+                            "id": request_id,
+                            "error": {
+                                "code": -32602,
+                                "message": "Atlas2 could not parse the request_user_input payload."
+                            }
+                        })
+                        .to_string(),
+                    );
+                    return true;
+                }
+            };
+
+            if !supports_telegram_user_input_questions(&parsed.questions) {
+                let _ = event_tx.send(CodexEvent::Status {
+                    text: "Codex requested interactive user input that Atlas2 cannot render as Telegram buttons."
+                        .into(),
+                });
+                let _ = handle.sender.send(
+                    json!({
+                        "id": request_id,
+                        "error": {
+                            "code": -32601,
+                            "message": "Atlas2 only supports option-based request_user_input prompts in Telegram."
+                        }
+                    })
+                    .to_string(),
+                );
+                return true;
+            }
+
+            let user_input_id = UserInputRequestId::new();
+            handle.user_inputs.lock().await.insert(
+                user_input_id.clone(),
+                PendingUserInputRequest {
+                    request_id: request_id.clone(),
+                },
             );
+            let _ = event_tx.send(CodexEvent::UserInputRequested {
+                request: CodexPendingUserInput {
+                    request_id: user_input_id,
+                    questions: parsed.questions,
+                },
+            });
             true
         }
         _ => {
@@ -786,10 +932,20 @@ async fn map_notification(
             outputs.entry(item_id).or_default().push_str(&delta);
             None
         }
+        "codex/event/task_complete" => map_task_complete_notification(params),
+        "item/plan/delta" | "turn/plan/updated" => None,
         "item/started" => map_item_started(params),
         "item/completed" => map_item_completed(params, command_outputs, text_outputs).await,
         _ => None,
     }
+}
+
+fn map_task_complete_notification(params: &Value) -> Option<CodexEvent> {
+    let message = params
+        .get("msg")
+        .and_then(|msg| msg.get("last_agent_message"))
+        .and_then(Value::as_str)?;
+    extract_proposed_plan_markdown(message).map(|markdown| CodexEvent::PlanCompleted { markdown })
 }
 
 fn map_item_started(params: &Value) -> Option<CodexEvent> {
@@ -832,8 +988,24 @@ async fn map_item_completed(
             };
             if text.is_empty() {
                 None
+            } else if let Some(markdown) = extract_proposed_plan_markdown(&text) {
+                Some(CodexEvent::PlanCompleted { markdown })
             } else {
                 Some(CodexEvent::Output { text })
+            }
+        }
+        "plan" | "Plan" => {
+            let markdown = item
+                .get("text")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("content").and_then(Value::as_str))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if markdown.is_empty() {
+                None
+            } else {
+                Some(CodexEvent::PlanCompleted { markdown })
             }
         }
         "commandExecution" => {
@@ -872,6 +1044,18 @@ async fn map_item_completed(
     }
 }
 
+fn extract_proposed_plan_markdown(text: &str) -> Option<String> {
+    let re = Regex::new(r"(?s)<proposed_plan>\s*(.*?)\s*</proposed_plan>")
+        .expect("valid proposed plan regex");
+    let captures = re.captures(text)?;
+    let markdown = captures.get(1)?.as_str().trim();
+    if markdown.is_empty() {
+        None
+    } else {
+        Some(markdown.to_string())
+    }
+}
+
 fn summarize_approval_request(method: &str, params: &Value) -> String {
     match method {
         "item/commandExecution/requestApproval" => {
@@ -897,6 +1081,17 @@ fn summarize_approval_request(method: &str, params: &Value) -> String {
             .to_string(),
         _ => "Codex requested approval.".into(),
     }
+}
+
+fn supports_telegram_user_input_questions(questions: &[UserInputQuestion]) -> bool {
+    !questions.is_empty()
+        && questions.iter().all(|question| {
+            question
+                .options
+                .as_ref()
+                .map(|options| !options.is_empty())
+                .unwrap_or(false)
+        })
 }
 
 fn extract_thread_id(value: &Value) -> Option<CodexThreadId> {
@@ -942,6 +1137,21 @@ fn merge_objects(base: Value, overlay: Value) -> Value {
     Value::Object(merged)
 }
 
+fn build_collaboration_mode(mode: PromptMode) -> Value {
+    let (mode_name, developer_instructions) = match mode {
+        PromptMode::Normal => ("default", CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS),
+        PromptMode::Plan => ("plan", CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS),
+    };
+    json!({
+        "mode": mode_name,
+        "settings": {
+            "model": CODEX_DEFAULT_MODEL,
+            "reasoning_effort": CODEX_DEFAULT_REASONING_EFFORT,
+            "developer_instructions": developer_instructions,
+        }
+    })
+}
+
 fn build_codex_prompt(prompt: &str, mode: PromptMode) -> String {
     match mode {
         PromptMode::Normal => prompt.to_string(),
@@ -950,7 +1160,27 @@ fn build_codex_prompt(prompt: &str, mode: PromptMode) -> String {
                 "You are in Atlas2 plan mode.\n",
                 "Analyze the request and return a concrete implementation plan only.\n",
                 "Do not modify files, do not apply patches, and do not run write operations.\n",
-                "You may inspect the codebase as needed.\n\n",
+                "You may inspect the codebase and run non-mutating commands as needed.\n",
+                "\n",
+                "Plan mode rules:\n",
+                "- Stay in plan mode until a developer message explicitly ends it.\n",
+                "- If the user asks you to implement while still in plan mode, treat it as a request to plan the implementation.\n",
+                "- Ask follow-up questions when they materially change the plan or confirm an important assumption.\n",
+                "- Strongly prefer the request_user_input tool for those follow-up questions whenever the choice can be expressed with meaningful options.\n",
+                "- Prefer exploring the repository before asking questions that can be answered from local context.\n",
+                "\n",
+                "Finalization rules:\n",
+                "- Only present the final plan when it is decision-complete and leaves no important decisions to the implementer.\n",
+                "- When you present the official plan, wrap it in a <proposed_plan> block exactly like this:\n",
+                "<proposed_plan>\n",
+                "# Plan title\n",
+                "...\n",
+                "</proposed_plan>\n",
+                "- The opening and closing tags must each be on their own line.\n",
+                "- Use Markdown inside the block.\n",
+                "- Output at most one <proposed_plan> block per turn.\n",
+                "- Do not ask \"should I proceed?\" after the final plan.\n",
+                "\n",
                 "User request:\n{}"
             ),
             prompt
@@ -966,9 +1196,13 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use super::{
-        CodexEvent, build_resume_cursor_json, extract_thread_id, extract_turn_id,
-        map_item_completed, map_notification, summarize_approval_request,
+        CODEX_DEFAULT_MODEL, CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS, CodexEvent,
+        ToolRequestUserInputParams, build_collaboration_mode, build_resume_cursor_json,
+        extract_proposed_plan_markdown, extract_thread_id, extract_turn_id, map_item_completed,
+        map_notification, map_task_complete_notification, summarize_approval_request,
+        supports_telegram_user_input_questions,
     };
+    use crate::domain::{PromptMode, UserInputOption, UserInputQuestion};
 
     #[test]
     fn extracts_thread_id_from_thread_notifications() {
@@ -1010,6 +1244,21 @@ mod tests {
         assert!(summary.contains("cargo test"));
     }
 
+    #[test]
+    fn accepts_option_based_user_input_questions_for_telegram() {
+        assert!(supports_telegram_user_input_questions(&[UserInputQuestion {
+            id: "next_step".into(),
+            header: "Plan".into(),
+            question: "What next?".into(),
+            is_other: false,
+            is_secret: false,
+            options: Some(vec![UserInputOption {
+                label: "Implement".into(),
+                description: "Start implementation".into(),
+            }]),
+        }]));
+    }
+
     #[tokio::test]
     async fn emits_agent_message_output_on_camel_case_item_completion() {
         let command_outputs = Arc::new(Mutex::new(HashMap::new()));
@@ -1035,6 +1284,120 @@ mod tests {
             CodexEvent::Output { text } => assert_eq!(text, "hello from codex"),
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn extracts_proposed_plan_markdown_from_tagged_message() {
+        let markdown = extract_proposed_plan_markdown(
+            "intro\n<proposed_plan>\n# Ship it\n\n- one\n</proposed_plan>\noutro",
+        )
+        .unwrap();
+        assert_eq!(markdown, "# Ship it\n\n- one");
+    }
+
+    #[tokio::test]
+    async fn maps_plan_items_to_plan_completed_events() {
+        let command_outputs = Arc::new(Mutex::new(HashMap::new()));
+        let text_outputs = Arc::new(Mutex::new(HashMap::new()));
+
+        let event = map_item_completed(
+            &json!({
+                "item": {
+                    "id": "plan_1",
+                    "type": "Plan",
+                    "text": "## Final plan\n\n- one\n- two"
+                }
+            }),
+            &command_outputs,
+            &text_outputs,
+        )
+        .await
+        .expect("plan completion event");
+
+        match event {
+            CodexEvent::PlanCompleted { markdown } => {
+                assert_eq!(markdown, "## Final plan\n\n- one\n- two");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_task_complete_notification_to_plan_completed_event() {
+        let event = map_task_complete_notification(&json!({
+            "id": "turn-1",
+            "msg": {
+                "type": "task_complete",
+                "turn_id": "turn-1",
+                "last_agent_message": "<proposed_plan>\n# Ship it\n\n- one\n</proposed_plan>"
+            }
+        }))
+        .expect("plan completion event");
+
+        match event {
+            CodexEvent::PlanCompleted { markdown } => {
+                assert_eq!(markdown, "# Ship it\n\n- one");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builds_plan_collaboration_mode_with_plan_instructions() {
+        let collaboration = build_collaboration_mode(PromptMode::Plan);
+
+        assert_eq!(collaboration["mode"], "plan");
+        assert_eq!(collaboration["settings"]["model"], CODEX_DEFAULT_MODEL);
+        assert!(
+            collaboration["settings"]["developer_instructions"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("request_user_input")
+        );
+    }
+
+    #[test]
+    fn plan_mode_instructions_require_proposed_plan_block() {
+        assert!(CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS.contains("<proposed_plan>"));
+    }
+
+    #[test]
+    fn parses_request_user_input_payload_without_optional_flags() {
+        let parsed: ToolRequestUserInputParams = serde_json::from_value(json!({
+            "questions": [
+                {
+                    "id": "scope",
+                    "header": "Scope",
+                    "question": "Pick one scope",
+                    "options": [
+                        {
+                            "label": "Small seam",
+                            "description": "Keep changes narrow"
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("request_user_input payload should parse");
+
+        assert_eq!(parsed.questions.len(), 1);
+        assert!(!parsed.questions[0].is_other);
+        assert!(!parsed.questions[0].is_secret);
+    }
+
+    #[test]
+    fn accepts_option_questions_even_with_optional_flags_enabled() {
+        assert!(supports_telegram_user_input_questions(&[UserInputQuestion {
+            id: "scope".into(),
+            header: "Scope".into(),
+            question: "Choose the scope".into(),
+            is_other: true,
+            is_secret: true,
+            options: Some(vec![UserInputOption {
+                label: "Small seam".into(),
+                description: "Keep changes narrow".into(),
+            }]),
+        }]));
     }
 
     #[tokio::test]

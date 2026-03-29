@@ -13,6 +13,8 @@ Each Telegram group has one active Codex session at a time. A group admin runs `
 - `/plan <prompt>` for a read-only planning turn
 - streamed progress/output back into Telegram as separate messages
 - long plain-text outputs split across multiple Telegram messages when needed
+- plan-mode multiple-choice follow-up questions rendered as Telegram buttons
+- completed plans get Telegram follow-up buttons for `Implement` and `Add details`
 - Stop button for live Codex turns
 - approval buttons when exposed by the Codex event stream
 - SQLite-backed session and approval state
