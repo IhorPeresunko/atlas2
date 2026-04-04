@@ -26,6 +26,7 @@ use crate::{
 
 const CODEX_DEFAULT_MODEL: &str = "gpt-5.3-codex";
 const CODEX_DEFAULT_REASONING_EFFORT: &str = "medium";
+const STALE_THREAD_RECOVERY_MESSAGE: &str = "Stored Codex conversation could not be resumed; Atlas2 started a fresh thread without prior conversation context.";
 const CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS: &str = concat!(
     "<collaboration_mode># Plan Mode\n\n",
     "You are in Plan Mode until a developer message explicitly ends it.\n",
@@ -74,87 +75,142 @@ impl CodexClient {
     where
         F: FnMut(CodexEvent) -> AppResult<()>,
     {
-        let mut runtime = AppServerRuntime::start(
-            &self.codex_bin,
-            &self.additional_dirs,
-            session.session_id.clone(),
-            &session.workspace_path.0,
-        )
-        .await?;
-        self.runtimes
-            .lock()
-            .await
-            .insert(session.session_id.clone(), runtime.handle());
+        let mut resume_thread_id = session.provider_thread_id.clone();
+        let mut retry_with_fresh_thread_available = session.provider_thread_id.is_some();
 
-        let run_result = async {
-            runtime.initialize().await?;
-            let opened_thread = runtime
-                .open_thread(
-                    session.provider_thread_id.as_ref(),
-                    session.resume_cursor_json.as_deref(),
-                    mode,
-                )
-                .await?;
+        loop {
+            let mut runtime = AppServerRuntime::start(
+                &self.codex_bin,
+                &self.additional_dirs,
+                session.session_id.clone(),
+                &session.workspace_path.0,
+            )
+            .await?;
+            self.runtimes
+                .lock()
+                .await
+                .insert(session.session_id.clone(), runtime.handle());
 
-            let mut result = CodexTurnResult {
-                thread_id: opened_thread.thread_id.clone(),
-                resume_cursor_json: opened_thread.resume_cursor_json.clone(),
-                ..CodexTurnResult::default()
-            };
-            if let Some(thread_id) = opened_thread.thread_id {
-                on_event(CodexEvent::ThreadStarted {
-                    thread_id,
-                    resume_cursor_json: opened_thread.resume_cursor_json,
-                })?;
-            }
+            let run_result = async {
+                runtime.initialize().await?;
+                let opened_thread = runtime
+                    .open_thread(
+                        resume_thread_id.as_ref(),
+                        session.resume_cursor_json.as_deref(),
+                        mode,
+                    )
+                    .await?;
 
-            runtime.start_turn(prompt, mode).await?;
+                if let Some(message) = opened_thread.recovery_message.as_ref() {
+                    on_event(CodexEvent::Status {
+                        text: message.clone(),
+                    })?;
+                }
 
-            loop {
-                let Some(event) = runtime.next_event().await? else {
-                    return Err(AppError::Codex(
-                        "codex app-server exited before the turn completed".into(),
-                    ));
+                let mut result = CodexTurnResult {
+                    thread_id: opened_thread.thread_id.clone(),
+                    resume_cursor_json: opened_thread.resume_cursor_json.clone(),
+                    ..CodexTurnResult::default()
                 };
-
-                match &event {
-                    CodexEvent::ThreadStarted {
+                if let Some(thread_id) = opened_thread.thread_id {
+                    on_event(CodexEvent::ThreadStarted {
                         thread_id,
-                        resume_cursor_json,
-                    } => {
-                        result.thread_id = Some(thread_id.clone());
-                        result.resume_cursor_json = resume_cursor_json.clone();
-                    }
-                    CodexEvent::TurnCompleted => {
-                        result.completed = true;
-                    }
-                    CodexEvent::TurnInterrupted { .. } => {
-                        result.interrupted = true;
-                    }
-                    CodexEvent::TurnFailed { message } => {
-                        result.failure = Some(message.clone());
-                    }
-                    _ => {}
+                        resume_cursor_json: opened_thread.resume_cursor_json,
+                    })?;
                 }
 
-                on_event(event.clone())?;
+                if let Err(error) = runtime.start_turn(prompt, mode).await {
+                    if should_retry_with_fresh_thread_after_error(
+                        resume_thread_id.as_ref(),
+                        retry_with_fresh_thread_available,
+                        &error,
+                    ) {
+                        on_event(CodexEvent::Status {
+                            text: STALE_THREAD_RECOVERY_MESSAGE.into(),
+                        })?;
+                        return Ok(CodexRunOutcome::RetryFreshThread);
+                    }
+                    return Err(error);
+                }
 
-                if result.completed || result.interrupted || result.failure.is_some() {
-                    break;
+                let mut saw_material_turn_activity = false;
+
+                loop {
+                    let Some(event) = runtime.next_event().await? else {
+                        return Err(AppError::Codex(
+                            "codex app-server exited before the turn completed".into(),
+                        ));
+                    };
+
+                    if let CodexEvent::TurnFailed { message } = &event {
+                        if should_retry_with_fresh_thread_after_failure(
+                            resume_thread_id.as_ref(),
+                            retry_with_fresh_thread_available,
+                            message,
+                            saw_material_turn_activity,
+                        ) {
+                            on_event(CodexEvent::Status {
+                                text: STALE_THREAD_RECOVERY_MESSAGE.into(),
+                            })?;
+                            return Ok(CodexRunOutcome::RetryFreshThread);
+                        }
+                    }
+
+                    match &event {
+                        CodexEvent::ThreadStarted {
+                            thread_id,
+                            resume_cursor_json,
+                        } => {
+                            result.thread_id = Some(thread_id.clone());
+                            result.resume_cursor_json = resume_cursor_json.clone();
+                        }
+                        CodexEvent::Output { .. }
+                        | CodexEvent::CommandStarted { .. }
+                        | CodexEvent::CommandFinished { .. }
+                        | CodexEvent::ApprovalRequested { .. }
+                        | CodexEvent::UserInputRequested { .. }
+                        | CodexEvent::PlanCompleted { .. } => {
+                            saw_material_turn_activity = true;
+                        }
+                        CodexEvent::TurnCompleted => {
+                            result.completed = true;
+                        }
+                        CodexEvent::TurnInterrupted { .. } => {
+                            result.interrupted = true;
+                        }
+                        CodexEvent::TurnFailed { message } => {
+                            result.failure = Some(message.clone());
+                        }
+                        CodexEvent::Status { .. } => {}
+                    }
+
+                    on_event(event.clone())?;
+
+                    if result.completed || result.interrupted || result.failure.is_some() {
+                        break;
+                    }
+                }
+
+                Ok(CodexRunOutcome::Finished(result))
+            }
+            .await;
+
+            self.runtimes.lock().await.remove(&session.session_id);
+            let shutdown_result = runtime.shutdown().await;
+            let outcome = match (run_result, shutdown_result) {
+                (Ok(outcome), Ok(())) => Ok(outcome),
+                (Err(error), Ok(())) => Err(error),
+                (Ok(_), Err(error)) => Err(error),
+                (Err(run_error), Err(_shutdown_error)) => Err(run_error),
+            }?;
+
+            match outcome {
+                CodexRunOutcome::Finished(result) => return Ok(result),
+                CodexRunOutcome::RetryFreshThread => {
+                    retry_with_fresh_thread_available = false;
+                    resume_thread_id = None;
                 }
             }
-
-            Ok(result)
-        }
-        .await;
-
-        self.runtimes.lock().await.remove(&session.session_id);
-        let shutdown_result = runtime.shutdown().await;
-        match (run_result, shutdown_result) {
-            (Ok(result), Ok(())) => Ok(result),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-            (Err(run_error), Err(_shutdown_error)) => Err(run_error),
         }
     }
 
@@ -271,10 +327,16 @@ pub struct CodexPendingUserInput {
     pub questions: Vec<UserInputQuestion>,
 }
 
+enum CodexRunOutcome {
+    Finished(CodexTurnResult),
+    RetryFreshThread,
+}
+
 #[derive(Debug, Clone)]
 struct ThreadOpenState {
     thread_id: Option<CodexThreadId>,
     resume_cursor_json: Option<String>,
+    recovery_message: Option<String>,
 }
 
 struct AppServerRuntime {
@@ -300,8 +362,6 @@ impl AppServerRuntime {
         let mut command = Command::new(codex_bin);
         command
             .arg("app-server")
-            .arg("--session-source")
-            .arg("cli")
             .current_dir(workspace_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -346,9 +406,10 @@ impl AppServerRuntime {
         let approvals = Arc::new(Mutex::new(
             HashMap::<ApprovalId, PendingApprovalRequest>::new(),
         ));
-        let user_inputs = Arc::new(Mutex::new(
-            HashMap::<UserInputRequestId, PendingUserInputRequest>::new(),
-        ));
+        let user_inputs = Arc::new(Mutex::new(HashMap::<
+            UserInputRequestId,
+            PendingUserInputRequest,
+        >::new()));
         let handle = Arc::new(LiveRuntimeHandle {
             approvals,
             user_inputs,
@@ -419,24 +480,37 @@ impl AppServerRuntime {
             params["sandbox"] = json!("read-only");
         }
 
-        let result = if let Some(thread_id) = provider_thread_id {
-            self.send_request(
-                "thread/resume",
-                merge_objects(
-                    params,
-                    json!({
-                        "threadId": thread_id.0,
-                    }),
-                ),
-            )
-            .await?
+        let start_params = params.clone();
+        let (result, recovery_message) = if let Some(thread_id) = provider_thread_id {
+            let resume_params = merge_objects(
+                params,
+                json!({
+                    "threadId": thread_id.0,
+                }),
+            );
+            match self.send_request("thread/resume", resume_params).await {
+                Ok(result) => (result, None),
+                Err(error) if should_restart_thread_from_resume_error(&error) => {
+                    tracing::warn!(
+                        thread_id = %thread_id.0,
+                        error = %error,
+                        "stored Codex thread could not be resumed; starting a fresh thread"
+                    );
+                    (
+                        self.send_request("thread/start", start_params).await?,
+                        Some(STALE_THREAD_RECOVERY_MESSAGE.into()),
+                    )
+                }
+                Err(error) => return Err(error),
+            }
         } else {
-            self.send_request("thread/start", params).await?
+            (self.send_request("thread/start", start_params).await?, None)
         };
 
         let state = ThreadOpenState {
             thread_id: extract_thread_id(&result),
             resume_cursor_json: build_resume_cursor_json(&result),
+            recovery_message,
         };
         self.handle.set_thread_id(state.thread_id.clone()).await;
         Ok(state)
@@ -717,11 +791,20 @@ async fn read_stdout_loop(
             }
         }
     }
+
+    let mut waiters = response_waiters.lock().await;
+    for (_id, sender) in waiters.drain() {
+        let _ = sender.send(Err(AppError::Codex(
+            "codex app-server closed stdout before replying".into(),
+        )));
+    }
 }
 
 async fn read_stderr_loop(reader: BufReader<tokio::process::ChildStderr>) {
     let mut lines = reader.lines();
-    while let Ok(Some(_line)) = lines.next_line().await {}
+    while let Ok(Some(line)) = lines.next_line().await {
+        tracing::warn!(stderr = line, "codex app-server stderr");
+    }
 }
 
 async fn handle_response(
@@ -1129,6 +1212,45 @@ fn extract_turn_id(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn is_stale_thread_error_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("invalid_encrypted_content")
+        || (message.contains("encrypted content")
+            && message.contains("could not")
+            && (message.contains("decrypted")
+                || message.contains("parsed")
+                || message.contains("verified")))
+}
+
+fn should_restart_thread_from_resume_error(error: &AppError) -> bool {
+    let AppError::Codex(message) = error else {
+        return false;
+    };
+    is_stale_thread_error_message(message)
+}
+
+fn should_retry_with_fresh_thread_after_error(
+    provider_thread_id: Option<&CodexThreadId>,
+    retry_with_fresh_thread_available: bool,
+    error: &AppError,
+) -> bool {
+    provider_thread_id.is_some()
+        && retry_with_fresh_thread_available
+        && should_restart_thread_from_resume_error(error)
+}
+
+fn should_retry_with_fresh_thread_after_failure(
+    provider_thread_id: Option<&CodexThreadId>,
+    retry_with_fresh_thread_available: bool,
+    failure_message: &str,
+    saw_material_turn_activity: bool,
+) -> bool {
+    provider_thread_id.is_some()
+        && retry_with_fresh_thread_available
+        && !saw_material_turn_activity
+        && is_stale_thread_error_message(failure_message)
+}
+
 fn merge_objects(base: Value, overlay: Value) -> Value {
     let mut merged = base.as_object().cloned().unwrap_or_default();
     for (key, value) in overlay.as_object().cloned().unwrap_or_default() {
@@ -1198,11 +1320,14 @@ mod tests {
     use super::{
         CODEX_DEFAULT_MODEL, CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS, CodexEvent,
         ToolRequestUserInputParams, build_collaboration_mode, build_resume_cursor_json,
-        extract_proposed_plan_markdown, extract_thread_id, extract_turn_id, map_item_completed,
-        map_notification, map_task_complete_notification, summarize_approval_request,
+        extract_proposed_plan_markdown, extract_thread_id, extract_turn_id,
+        is_stale_thread_error_message, map_item_completed, map_notification,
+        map_task_complete_notification, should_restart_thread_from_resume_error,
+        should_retry_with_fresh_thread_after_failure, summarize_approval_request,
         supports_telegram_user_input_questions,
     };
     use crate::domain::{PromptMode, UserInputOption, UserInputQuestion};
+    use crate::error::AppError;
 
     #[test]
     fn extracts_thread_id_from_thread_notifications() {
@@ -1220,6 +1345,50 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(cursor, r#"{"threadId":"thread_123"}"#);
+    }
+
+    #[test]
+    fn retries_with_fresh_thread_after_invalid_encrypted_content_resume_error() {
+        let error = AppError::Codex(
+            "The encrypted content gAAA... could not be verified. Reason: Encrypted content could not be decrypted or parsed. code=invalid_encrypted_content"
+                .into(),
+        );
+
+        assert!(should_restart_thread_from_resume_error(&error));
+    }
+
+    #[test]
+    fn does_not_restart_thread_for_unrelated_resume_errors() {
+        let error = AppError::Codex("thread/resume failed with rate limit".into());
+
+        assert!(!should_restart_thread_from_resume_error(&error));
+    }
+
+    #[test]
+    fn detects_stale_thread_error_from_turn_failure_message() {
+        assert!(is_stale_thread_error_message(
+            "The encrypted content gAAA... could not be verified. Reason: Encrypted content could not be decrypted or parsed."
+        ));
+    }
+
+    #[test]
+    fn retries_with_fresh_thread_after_early_stale_thread_failure() {
+        assert!(should_retry_with_fresh_thread_after_failure(
+            Some(&crate::domain::CodexThreadId("thread_123".into())),
+            true,
+            "invalid_encrypted_content",
+            false,
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_with_fresh_thread_after_material_turn_activity() {
+        assert!(!should_retry_with_fresh_thread_after_failure(
+            Some(&crate::domain::CodexThreadId("thread_123".into())),
+            true,
+            "invalid_encrypted_content",
+            true,
+        ));
     }
 
     #[test]
@@ -1246,17 +1415,19 @@ mod tests {
 
     #[test]
     fn accepts_option_based_user_input_questions_for_telegram() {
-        assert!(supports_telegram_user_input_questions(&[UserInputQuestion {
-            id: "next_step".into(),
-            header: "Plan".into(),
-            question: "What next?".into(),
-            is_other: false,
-            is_secret: false,
-            options: Some(vec![UserInputOption {
-                label: "Implement".into(),
-                description: "Start implementation".into(),
-            }]),
-        }]));
+        assert!(supports_telegram_user_input_questions(&[
+            UserInputQuestion {
+                id: "next_step".into(),
+                header: "Plan".into(),
+                question: "What next?".into(),
+                is_other: false,
+                is_secret: false,
+                options: Some(vec![UserInputOption {
+                    label: "Implement".into(),
+                    description: "Start implementation".into(),
+                }]),
+            }
+        ]));
     }
 
     #[tokio::test]
@@ -1387,17 +1558,19 @@ mod tests {
 
     #[test]
     fn accepts_option_questions_even_with_optional_flags_enabled() {
-        assert!(supports_telegram_user_input_questions(&[UserInputQuestion {
-            id: "scope".into(),
-            header: "Scope".into(),
-            question: "Choose the scope".into(),
-            is_other: true,
-            is_secret: true,
-            options: Some(vec![UserInputOption {
-                label: "Small seam".into(),
-                description: "Keep changes narrow".into(),
-            }]),
-        }]));
+        assert!(supports_telegram_user_input_questions(&[
+            UserInputQuestion {
+                id: "scope".into(),
+                header: "Scope".into(),
+                question: "Choose the scope".into(),
+                is_other: true,
+                is_secret: true,
+                options: Some(vec![UserInputOption {
+                    label: "Small seam".into(),
+                    description: "Keep changes narrow".into(),
+                }]),
+            }
+        ]));
     }
 
     #[tokio::test]

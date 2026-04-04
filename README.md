@@ -2,11 +2,11 @@
 
 Atlas2 connects Telegram groups to local Codex CLI sessions.
 
-Each Telegram group has one active Codex session at a time. A group admin runs `/new`, selects a working directory on the host, and then sends prompts in the group. Atlas2 uses `codex app-server --session-source cli`, streams Codex output back into Telegram as separate progress messages, and stores session state in SQLite.
+Each Telegram group has one active Codex session at a time. A group admin runs `/new`, selects a historic project or taps `Add new project` to browse for a working directory, and then sends prompts in the group. Atlas2 uses `codex app-server`, streams Codex output back into Telegram as separate progress messages, and stores session state in SQLite.
 
 ## Current Features
 
-- `/new` folder selection inside Telegram
+- `/new` historic project picker plus folder selection inside Telegram
 - one active session per Telegram group
 - prompts sent from Telegram to Codex
 - Telegram `voice` messages transcribed through ElevenLabs STT when enabled
@@ -54,7 +54,7 @@ cargo run -- --stt-provider 11labs --stt-api-key sk_...
 1. Add the bot to a Telegram group.
 2. Make the bot an admin.
 3. Send `/new`.
-4. Select a folder.
+4. Reuse a historic project or tap `Add new project` and select a folder.
 5. Send prompts in the group.
 6. Send a Telegram voice message to have Atlas2 transcribe it and forward the transcript to Codex.
 7. Use `/plan <prompt>` when you want a plan-only turn without file changes.

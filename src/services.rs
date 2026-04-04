@@ -11,9 +11,9 @@ use crate::{
     codex::{CodexClient, CodexEvent},
     config::Config,
     domain::{
-        ApprovalId, ApprovalStatus, FolderBrowseState, PendingApproval, PendingPlanFollowUp,
-        PendingUserInput, PlanFollowUpId, PlanFollowUpStatus, PromptMode, SessionBackend,
-        SessionId, SessionRecord, SessionStatus, TelegramChatId, TelegramUserId,
+        ApprovalId, ApprovalStatus, FolderBrowseState, HistoricProject, PendingApproval,
+        PendingPlanFollowUp, PendingUserInput, PlanFollowUpId, PlanFollowUpStatus, PromptMode,
+        SessionBackend, SessionId, SessionRecord, SessionStatus, TelegramChatId, TelegramUserId,
         UserInputAnswer, UserInputOption, UserInputRequestId, UserInputStatus, WorkspacePath,
     },
     error::{AppError, AppResult},
@@ -24,6 +24,7 @@ use crate::{
 };
 
 const TELEGRAM_TEXT_LIMIT: usize = 3900;
+const HISTORIC_PROJECT_LIMIT: usize = 8;
 
 #[derive(Debug, Clone)]
 struct LiveTurnControl {
@@ -73,6 +74,28 @@ impl AppServices {
         }
     }
 
+    pub async fn begin_new_session(
+        &self,
+        chat_id: TelegramChatId,
+    ) -> AppResult<(String, InlineKeyboardMarkup)> {
+        let historic = self
+            .storage
+            .list_historic_projects_for_chat(chat_id, HISTORIC_PROJECT_LIMIT)
+            .await?;
+        let historic = self.filter_existing_historic_projects(historic).await;
+
+        if historic.is_empty() {
+            let text = self.begin_folder_selection(chat_id).await?;
+            let markup = self.folder_markup("/").await?;
+            return Ok((text, markup));
+        }
+
+        Ok((
+            render_historic_projects_prompt(),
+            historic_projects_markup(&historic),
+        ))
+    }
+
     pub async fn register_chat(
         &self,
         chat_id: TelegramChatId,
@@ -113,21 +136,56 @@ impl AppServices {
         payload: &str,
     ) -> AppResult<FolderCallbackResult> {
         self.require_group_admin(chat_id, user_id).await?;
+        self.handle_folder_callback_authorized(chat_id, payload)
+            .await
+    }
 
-        let state = self
-            .storage
-            .get_folder_browse_state(chat_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::Validation("no active folder selection for this group".into())
-            })?;
-
+    async fn handle_folder_callback_authorized(
+        &self,
+        chat_id: TelegramChatId,
+        payload: &str,
+    ) -> AppResult<FolderCallbackResult> {
         let mut parts = payload.splitn(3, ':');
         let action = parts.next().unwrap_or_default();
         let raw_value = parts.next().unwrap_or_default();
 
         match action {
+            "project-history-select" => {
+                let source_session_id =
+                    SessionId(uuid::Uuid::parse_str(raw_value).map_err(|error| {
+                        AppError::Validation(format!(
+                            "invalid historic project session ID in callback: {error}"
+                        ))
+                    })?);
+                let source_workspace = self
+                    .storage
+                    .get_session_workspace_for_chat(chat_id, &source_session_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::Validation("historic project no longer exists".into())
+                    })?;
+                let workspace = self
+                    .filesystem
+                    .normalize_directory(&source_workspace.0)
+                    .await?;
+                let text = self.start_new_session(chat_id, workspace).await?;
+                Ok(FolderCallbackResult::Replace(text))
+            }
+            "project-add-new" => {
+                let text = self.begin_folder_selection(chat_id).await?;
+                Ok(FolderCallbackResult::Render(
+                    text,
+                    self.folder_markup("/").await?,
+                ))
+            }
             "folder-open" => {
+                let state = self
+                    .storage
+                    .get_folder_browse_state(chat_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::Validation("no active folder selection for this group".into())
+                    })?;
                 let target = self
                     .resolve_folder_entry(&state.current_path.0, raw_value)
                     .await?;
@@ -144,6 +202,13 @@ impl AppServices {
                 ))
             }
             "folder-up" => {
+                let state = self
+                    .storage
+                    .get_folder_browse_state(chat_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::Validation("no active folder selection for this group".into())
+                    })?;
                 let parent = self
                     .filesystem
                     .parent_directory(&state.current_path.0)
@@ -161,33 +226,20 @@ impl AppServices {
                 ))
             }
             "folder-select" => {
+                let state = self
+                    .storage
+                    .get_folder_browse_state(chat_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::Validation("no active folder selection for this group".into())
+                    })?;
                 let workspace = self
                     .filesystem
                     .normalize_directory(&state.current_path.0)
                     .await?;
                 self.storage.clear_folder_browse_state(chat_id).await?;
-
-                let now = Utc::now();
-                let session = SessionRecord {
-                    session_id: SessionId::new(),
-                    chat_id,
-                    workspace_path: workspace.clone(),
-                    backend: SessionBackend::AppServer,
-                    provider_thread_id: None,
-                    resume_cursor_json: None,
-                    status: SessionStatus::Ready,
-                    last_error: None,
-                    created_at: now,
-                    updated_at: now,
-                };
-                self.storage.insert_session(&session).await?;
-                self.storage
-                    .set_active_session(chat_id, Some(&session.session_id))
-                    .await?;
-                Ok(FolderCallbackResult::Replace(format!(
-                    "Started new session in `{}`.\nSend a prompt to start working.",
-                    workspace.0
-                )))
+                let text = self.start_new_session(chat_id, workspace).await?;
+                Ok(FolderCallbackResult::Replace(text))
             }
             "folder-cancel" => {
                 self.storage.clear_folder_browse_state(chat_id).await?;
@@ -197,6 +249,52 @@ impl AppServices {
             }
             _ => Err(AppError::Validation("unknown folder action".into())),
         }
+    }
+
+    async fn filter_existing_historic_projects(
+        &self,
+        projects: Vec<HistoricProject>,
+    ) -> Vec<HistoricProject> {
+        let mut existing = Vec::new();
+        for project in projects {
+            if self
+                .filesystem
+                .normalize_directory(&project.workspace_path.0)
+                .await
+                .is_ok()
+            {
+                existing.push(project);
+            }
+        }
+        existing
+    }
+
+    async fn start_new_session(
+        &self,
+        chat_id: TelegramChatId,
+        workspace: WorkspacePath,
+    ) -> AppResult<String> {
+        let now = Utc::now();
+        let session = SessionRecord {
+            session_id: SessionId::new(),
+            chat_id,
+            workspace_path: workspace.clone(),
+            backend: SessionBackend::AppServer,
+            provider_thread_id: None,
+            resume_cursor_json: None,
+            status: SessionStatus::Ready,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.storage.insert_session(&session).await?;
+        self.storage
+            .set_active_session(chat_id, Some(&session.session_id))
+            .await?;
+        Ok(format!(
+            "Started new session in `{}`.\nSend a prompt to start working.",
+            workspace.0
+        ))
     }
 
     async fn render_folder_prompt(
@@ -391,7 +489,9 @@ impl AppServices {
             UserInputAdvance::NextQuestion { text, markup } => {
                 Ok(UserInputCallbackResult::Render(text, markup))
             }
-            UserInputAdvance::Completed { summary } => Ok(UserInputCallbackResult::Replace(summary)),
+            UserInputAdvance::Completed { summary } => {
+                Ok(UserInputCallbackResult::Replace(summary))
+            }
         }
     }
 
@@ -403,7 +503,11 @@ impl AppServices {
     ) -> AppResult<Option<UserInputTextResult>> {
         self.require_group_admin(chat_id, user_id).await?;
 
-        let request = match self.storage.get_pending_user_input_for_chat(chat_id).await? {
+        let request = match self
+            .storage
+            .get_pending_user_input_for_chat(chat_id)
+            .await?
+        {
             Some(request) => request,
             None => return Ok(None),
         };
@@ -640,6 +744,14 @@ impl AppServices {
     ) -> AppResult<()> {
         let _chat_binding = self.storage.get_chat(chat_id).await?;
         let session = self.require_active_session(chat_id).await?;
+        tracing::info!(
+            chat_id = chat_id.0,
+            session_id = %session.session_id.0,
+            mode = ?mode,
+            workspace_path = session.workspace_path.0,
+            prompt_chars = prompt.chars().count(),
+            "starting Codex prompt"
+        );
         if session.backend != SessionBackend::AppServer {
             return Err(AppError::Validation(
                 "this session was created before the app-server migration and cannot continue; run /new to start a fresh session".into(),
@@ -852,6 +964,15 @@ impl AppServices {
 
         match result {
             Ok(result) => {
+                tracing::info!(
+                    chat_id = chat_id.0,
+                    session_id = %session.session_id.0,
+                    completed = result.completed,
+                    interrupted = result.interrupted,
+                    has_failure = result.failure.is_some(),
+                    thread_id = result.thread_id.as_ref().map(|id| id.0.as_str()).unwrap_or(""),
+                    "Codex prompt finished"
+                );
                 let live_turn = self.live_turns.lock().await.remove(&session.session_id);
                 let terminal_state = match &live_turn {
                     Some(live_turn) if live_turn.stop_requested => TurnTerminalState::Stopped,
@@ -863,8 +984,17 @@ impl AppServices {
                     None => TurnTerminalState::Completed,
                 };
                 if let Some(live_turn) = live_turn {
-                    self.finish_turn_control(live_turn, terminal_state, result.failure.as_deref())
-                        .await?;
+                    if let Err(error) = self
+                        .finish_turn_control(live_turn, terminal_state, result.failure.as_deref())
+                        .await
+                    {
+                        tracing::warn!(
+                            chat_id = chat_id.0,
+                            session_id = %session.session_id.0,
+                            error = %error,
+                            "failed to update Telegram turn control message"
+                        );
+                    }
                 }
                 if let Some(thread_id) = result.thread_id.as_ref() {
                     self.storage
@@ -897,6 +1027,12 @@ impl AppServices {
                 Ok(())
             }
             Err(error) => {
+                tracing::error!(
+                    chat_id = chat_id.0,
+                    session_id = %session.session_id.0,
+                    error = %error,
+                    "Codex prompt execution failed"
+                );
                 let live_turn = self.live_turns.lock().await.remove(&session.session_id);
                 if let Some(live_turn) = live_turn {
                     let _ = self
@@ -1006,7 +1142,11 @@ impl AppServices {
         }
 
         self.codex
-            .resolve_user_input(&request.session_id, &request.request_id, request.answers.clone())
+            .resolve_user_input(
+                &request.session_id,
+                &request.request_id,
+                request.answers.clone(),
+            )
             .await?;
         self.storage
             .resolve_pending_user_input(
@@ -1044,6 +1184,23 @@ pub enum UserInputTextResult {
 pub enum PlanFollowUpCallbackResult {
     Replace(String),
     Implement { text: String, prompt: String },
+}
+
+fn render_historic_projects_prompt() -> String {
+    "Select a project or add a new one.".into()
+}
+
+fn historic_projects_markup(projects: &[HistoricProject]) -> InlineKeyboardMarkup {
+    let mut buttons = Vec::new();
+    for project in projects {
+        let label = format!("Reuse {}", compact_absolute_path(&project.workspace_path.0));
+        buttons.push(button(
+            label,
+            format!("project-history-select:{}", project.source_session_id.0),
+        ));
+    }
+    buttons.push(button("Add new project", "project-add-new:current"));
+    InlineKeyboardMarkup::single_column(buttons)
 }
 
 fn trim_for_telegram(text: &str) -> String {
@@ -1510,25 +1667,46 @@ fn split_path_suffix(path: &str) -> (&str, &str) {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        domain::{PromptMode, SessionId},
-        services::{
-            TELEGRAM_TEXT_LIMIT, TelegramTurnUpdate, TurnTerminalState, build_codex_prompt,
-            build_plan_implementation_prompt, compact_text_for_telegram,
-            plan_follow_up_markup, render_command_finished_message, render_turn_terminal_text,
-            render_user_input_prompt, render_voice_transcript_message, send_clear_status_update,
-            send_status_update, send_text_update, trim_for_telegram, turn_control_markup,
-            user_input_markup,
-        },
-        telegram::ParseMode,
-    };
+    use crate::codex::CodexClient;
+    use crate::config::{Config, SttProvider};
     use crate::domain::{
-        PendingPlanFollowUp, PendingUserInput, PlanFollowUpId, PlanFollowUpStatus,
-        TelegramChatId, UserInputOption, UserInputQuestion, UserInputRequestId, UserInputStatus,
+        HistoricProject, PendingPlanFollowUp, PendingUserInput, PlanFollowUpId, PlanFollowUpStatus,
+        SessionBackend, SessionId, SessionRecord, SessionStatus, TelegramChatId, UserInputOption,
+        UserInputQuestion, UserInputRequestId, UserInputStatus, WorkspacePath,
+    };
+    use crate::{
+        domain::PromptMode,
+        services::{
+            AppServices, TELEGRAM_TEXT_LIMIT, TelegramTurnUpdate, TurnTerminalState,
+            build_codex_prompt, build_plan_implementation_prompt, compact_text_for_telegram,
+            historic_projects_markup, plan_follow_up_markup, render_command_finished_message,
+            render_historic_projects_prompt, render_turn_terminal_text, render_user_input_prompt,
+            render_voice_transcript_message, send_clear_status_update, send_status_update,
+            send_text_update, trim_for_telegram, turn_control_markup, user_input_markup,
+        },
+        storage::Storage,
+        stt::SttClient,
+        telegram::ParseMode,
+        telegram::TelegramClient,
     };
     use chrono::Utc;
     use std::collections::HashMap;
+    use tempfile::tempdir;
     use tokio::sync::mpsc::unbounded_channel;
+
+    fn test_config() -> Config {
+        Config {
+            telegram_bot_token: "test-token".into(),
+            telegram_api_base: "http://127.0.0.1:9".into(),
+            database_url: "sqlite::memory:".into(),
+            codex_bin: "codex".into(),
+            poll_timeout_seconds: 30,
+            max_directory_entries: 20,
+            workspace_additional_writable_dirs: Vec::new(),
+            stt_provider: SttProvider::None,
+            stt_api_key: None,
+        }
+    }
 
     #[test]
     fn trims_large_messages() {
@@ -1754,9 +1932,11 @@ mod tests {
         assert!(text.contains("Reply with a button tap or send a text answer."));
         assert!(text.contains("Implement: Start the code changes now."));
         assert_eq!(markup.inline_keyboard.len(), 2);
-        assert!(markup.inline_keyboard[0][0]
-            .callback_data
-            .starts_with("user-input-answer:"));
+        assert!(
+            markup.inline_keyboard[0][0]
+                .callback_data
+                .starts_with("user-input-answer:")
+        );
     }
 
     #[test]
@@ -1776,9 +1956,85 @@ mod tests {
 
         assert_eq!(markup.inline_keyboard[0][0].text, "Implement");
         assert_eq!(markup.inline_keyboard[0][1].text, "Add details");
-        assert!(markup.inline_keyboard[0][0]
-            .callback_data
-            .starts_with("plan-implement:"));
+        assert!(
+            markup.inline_keyboard[0][0]
+                .callback_data
+                .starts_with("plan-implement:")
+        );
         assert_eq!(prompt, "PLEASE IMPLEMENT THIS PLAN:\n# Ship it\n\n- one");
+    }
+
+    #[test]
+    fn renders_historic_projects_prompt_and_markup() {
+        let projects = vec![HistoricProject {
+            source_session_id: SessionId::new(),
+            workspace_path: WorkspacePath("/home/ihor/code/atlas2".into()),
+        }];
+
+        let text = render_historic_projects_prompt();
+        let markup = historic_projects_markup(&projects);
+
+        assert_eq!(text, "Select a project or add a new one.");
+        assert_eq!(markup.inline_keyboard.len(), 2);
+        assert_eq!(markup.inline_keyboard[0][0].text, "Reuse .../code/atlas2");
+        assert!(
+            markup.inline_keyboard[0][0]
+                .callback_data
+                .starts_with("project-history-select:")
+        );
+        assert_eq!(markup.inline_keyboard[1][0].text, "Add new project");
+        assert_eq!(
+            markup.inline_keyboard[1][0].callback_data,
+            "project-add-new:current"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_new_session_shows_historic_projects_for_chat() {
+        let storage = Storage::connect("sqlite::memory:").await.unwrap();
+        let temp = tempdir().unwrap();
+        let workspace = WorkspacePath(temp.path().to_string_lossy().into_owned());
+        let chat_id = TelegramChatId(99);
+        storage
+            .upsert_chat(chat_id, "supergroup", Some("Atlas"))
+            .await
+            .unwrap();
+        storage
+            .insert_session(&SessionRecord {
+                session_id: SessionId::new(),
+                chat_id,
+                workspace_path: workspace.clone(),
+                backend: SessionBackend::AppServer,
+                provider_thread_id: None,
+                resume_cursor_json: None,
+                status: SessionStatus::Ready,
+                last_error: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let services = AppServices::new(
+            test_config(),
+            storage,
+            TelegramClient::new("http://127.0.0.1:9", "token"),
+            crate::filesystem::FilesystemService::default(),
+            CodexClient::new("codex".into(), Vec::new()),
+            SttClient::Disabled,
+        );
+
+        let (text, markup) = services.begin_new_session(chat_id).await.unwrap();
+
+        assert_eq!(text, "Select a project or add a new one.");
+        assert_eq!(
+            markup.inline_keyboard.last().unwrap()[0].text,
+            "Add new project"
+        );
+        assert!(
+            markup.inline_keyboard[0][0]
+                .callback_data
+                .starts_with("project-history-select:")
+        );
     }
 }

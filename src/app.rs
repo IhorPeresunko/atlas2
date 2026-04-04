@@ -60,8 +60,11 @@ impl App {
     }
 
     async fn handle_update(&self, update: crate::telegram::Update) -> AppResult<()> {
+        let update_id = update.update_id;
         if let Some(message) = update.message {
             let chat_id = TelegramChatId(message.chat.id);
+            let chat_kind = message.chat.kind.clone();
+            let chat_title = message.chat.title.clone();
             self.services
                 .register_chat(chat_id, &message.chat.kind, message.chat.title.as_deref())
                 .await?;
@@ -73,12 +76,27 @@ impl App {
                 .ok_or_else(|| AppError::Validation("message missing sender".into()))?;
 
             if let Some(text) = message.text.clone() {
+                tracing::info!(
+                    update_id,
+                    chat_id = chat_id.0,
+                    user_id = user_id.0,
+                    chat_kind,
+                    chat_title = chat_title.as_deref().unwrap_or(""),
+                    text_preview = preview_text(&text),
+                    "received Telegram text message"
+                );
                 if !text.starts_with('/') {
                     if let Some(result) = self
                         .services
                         .consume_user_input_text(chat_id, user_id, &text)
                         .await?
                     {
+                        tracing::info!(
+                            update_id,
+                            chat_id = chat_id.0,
+                            user_id = user_id.0,
+                            "routing message to pending user input flow"
+                        );
                         match result {
                             UserInputTextResult::Render(text, markup) => {
                                 self.services
@@ -95,10 +113,26 @@ impl App {
                         }
                         return Ok(());
                     }
-                    if let Some(prompt) = self.services.consume_plan_refinement(chat_id, &text).await? {
+                    if let Some(prompt) = self
+                        .services
+                        .consume_plan_refinement(chat_id, &text)
+                        .await?
+                    {
+                        tracing::info!(
+                            update_id,
+                            chat_id = chat_id.0,
+                            user_id = user_id.0,
+                            prompt_preview = preview_text(&prompt),
+                            "routing message to plan refinement flow"
+                        );
                         let services = self.services.clone();
                         tokio::spawn(async move {
                             if let Err(error) = services.run_plan_prompt(chat_id, &prompt).await {
+                                tracing::error!(
+                                    chat_id = chat_id.0,
+                                    error = %error,
+                                    "plan refinement prompt failed"
+                                );
                                 let _ = services
                                     .telegram
                                     .send_message(
@@ -114,13 +148,22 @@ impl App {
                     }
                 }
 
-                match parse_message_text(&text) {
+                let route = parse_message_text(&text);
+                tracing::info!(
+                    update_id,
+                    chat_id = chat_id.0,
+                    user_id = user_id.0,
+                    route = incoming_message_name(&route),
+                    "parsed Telegram text message"
+                );
+
+                match route {
                     IncomingMessage::Help => {
                         self.services
                             .telegram
                             .send_message(
                                 chat_id,
-                                "Atlas2 commands:\n/new - select a folder and create a new session\n/sessions - list known sessions\n/plan <prompt> - run a read-only planning turn\nAny other text - send a prompt to the active Codex session\nUse the Stop button on a running turn to interrupt it.",
+                                "Atlas2 commands:\n/new - reuse a historic project or add a new project folder\n/sessions - list known sessions\n/plan <prompt> - run a read-only planning turn\nAny other text - send a prompt to the active Codex session\nUse the Stop button on a running turn to interrupt it.",
                                 None,
                                 None,
                             )
@@ -128,8 +171,7 @@ impl App {
                     }
                     IncomingMessage::NewSession => {
                         self.services.require_group_admin(chat_id, user_id).await?;
-                        let text = self.services.begin_folder_selection(chat_id).await?;
-                        let markup = self.services.folder_markup("/").await?;
+                        let (text, markup) = self.services.begin_new_session(chat_id).await?;
                         self.services
                             .telegram
                             .send_message(chat_id, &text, None, Some(markup))
@@ -147,6 +189,12 @@ impl App {
                         let services = self.services.clone();
                         tokio::spawn(async move {
                             if let Err(error) = services.run_plan_prompt(chat_id, &prompt).await {
+                                tracing::error!(
+                                    chat_id = chat_id.0,
+                                    error = %error,
+                                    prompt_preview = preview_text(&prompt),
+                                    "plan prompt failed"
+                                );
                                 let _ = services
                                     .telegram
                                     .send_message(
@@ -176,6 +224,12 @@ impl App {
                         let services = self.services.clone();
                         tokio::spawn(async move {
                             if let Err(error) = services.run_prompt(chat_id, &prompt).await {
+                                tracing::error!(
+                                    chat_id = chat_id.0,
+                                    error = %error,
+                                    prompt_preview = preview_text(&prompt),
+                                    "prompt failed"
+                                );
                                 let _ = services
                                     .telegram
                                     .send_message(
@@ -193,6 +247,13 @@ impl App {
             }
 
             if let Some(voice) = message.voice {
+                tracing::info!(
+                    update_id,
+                    chat_id = chat_id.0,
+                    user_id = user_id.0,
+                    file_id = voice.file_id,
+                    "received Telegram voice message"
+                );
                 let services = self.services.clone();
                 tokio::spawn(async move {
                     if let Err(error) = services
@@ -204,6 +265,11 @@ impl App {
                         )
                         .await
                     {
+                        tracing::error!(
+                            chat_id = chat_id.0,
+                            error = %error,
+                            "voice prompt failed"
+                        );
                         let _ = services
                             .telegram
                             .send_message(chat_id, &format!("Prompt failed: {error}"), None, None)
@@ -224,6 +290,13 @@ impl App {
             let Some(data) = callback.data.as_deref() else {
                 return Ok(());
             };
+            tracing::info!(
+                update_id,
+                chat_id = chat_id.0,
+                user_id = user_id.0,
+                callback_data = data,
+                "received Telegram callback query"
+            );
 
             let response = if let Some(id) = data.strip_prefix("approval-approve:") {
                 let approval_id = ApprovalId(uuid::Uuid::parse_str(id).map_err(|error| {
@@ -251,11 +324,13 @@ impl App {
                     .next()
                     .ok_or_else(|| AppError::Validation("missing user input request ID".into()))
                     .and_then(|id| {
-                        uuid::Uuid::parse_str(id).map(UserInputRequestId).map_err(|error| {
-                            AppError::Validation(format!(
-                                "invalid user input request ID in callback: {error}"
-                            ))
-                        })
+                        uuid::Uuid::parse_str(id)
+                            .map(UserInputRequestId)
+                            .map_err(|error| {
+                                AppError::Validation(format!(
+                                    "invalid user input request ID in callback: {error}"
+                                ))
+                            })
                     })?;
                 let question_index = parts
                     .next()
@@ -395,7 +470,17 @@ impl App {
 
             let callback_text = match response {
                 Ok(text) => text,
-                Err(error) => error.to_string(),
+                Err(error) => {
+                    tracing::error!(
+                        update_id,
+                        chat_id = chat_id.0,
+                        user_id = user_id.0,
+                        callback_data = data,
+                        error = %error,
+                        "Telegram callback handling failed"
+                    );
+                    error.to_string()
+                }
             };
             self.services
                 .telegram
@@ -404,6 +489,29 @@ impl App {
         }
 
         Ok(())
+    }
+}
+
+fn incoming_message_name(message: &IncomingMessage<'_>) -> &'static str {
+    match message {
+        IncomingMessage::Help => "help",
+        IncomingMessage::NewSession => "new_session",
+        IncomingMessage::Sessions => "sessions",
+        IncomingMessage::Plan(_) => "plan",
+        IncomingMessage::PlanUsage => "plan_usage",
+        IncomingMessage::UnknownCommand => "unknown_command",
+        IncomingMessage::Prompt(_) => "prompt",
+    }
+}
+
+fn preview_text(text: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 120;
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let preview: String = compact.chars().take(MAX_PREVIEW_CHARS).collect();
+    if compact.chars().count() > MAX_PREVIEW_CHARS {
+        format!("{preview}...")
+    } else {
+        preview
     }
 }
 
@@ -461,7 +569,7 @@ fn ensure_database_parent_dir(database_url: &str) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{IncomingMessage, parse_message_text};
+    use super::{IncomingMessage, parse_message_text, preview_text};
 
     #[test]
     fn parses_plan_command_with_inline_prompt() {
@@ -475,5 +583,18 @@ mod tests {
     fn rejects_empty_plan_command() {
         assert_eq!(parse_message_text("/plan"), IncomingMessage::PlanUsage);
         assert_eq!(parse_message_text("/plan   "), IncomingMessage::PlanUsage);
+    }
+
+    #[test]
+    fn parses_plain_text_as_prompt() {
+        assert_eq!(
+            parse_message_text("hello world"),
+            IncomingMessage::Prompt("hello world")
+        );
+    }
+
+    #[test]
+    fn preview_text_compacts_whitespace() {
+        assert_eq!(preview_text("hello\n\nworld"), "hello world");
     }
 }

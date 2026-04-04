@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 use std::collections::HashMap;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TelegramChatId(pub i64);
@@ -298,6 +298,12 @@ pub struct DirectoryEntry {
 pub struct FolderBrowseState {
     pub chat_id: TelegramChatId,
     pub current_path: WorkspacePath,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoricProject {
+    pub source_session_id: SessionId,
+    pub workspace_path: WorkspacePath,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

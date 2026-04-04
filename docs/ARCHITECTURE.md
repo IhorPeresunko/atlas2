@@ -33,7 +33,7 @@ Atlas2 is a single-process Rust service that connects Telegram groups to Codex C
 5. The filesystem service validates and canonicalizes workspace paths before session creation.
 6. The Telegram adapter fetches file metadata and downloads voice-note payloads when a Telegram `voice` message is received.
 7. The STT adapter uploads the audio payload to ElevenLabs and returns a transcript string.
-8. The Codex adapter spawns `codex app-server --session-source cli` over stdio, initializes JSON-RPC, starts or resumes the provider thread for the active Atlas session, and translates app-server notifications and requests into internal domain events.
+8. The Codex adapter spawns `codex app-server` over stdio, initializes JSON-RPC, starts or resumes the provider thread for the active Atlas session, and translates app-server notifications and requests into internal domain events.
 9. The Telegram adapter reflects those events back into Telegram:
    - folder browser message edits
    - ordered progress/output messages, one per streamed chunk
@@ -81,7 +81,8 @@ SQLite currently stores:
 
 ## Telegram Interaction Model
 
-- `/new` creates a folder browser rooted at `/`.
+- `/new` first renders historic workspace buttons for the current chat, plus `Add new project`.
+- Tapping `Add new project` creates a folder browser rooted at `/`.
 - `/plan <prompt>` sends a read-only planning turn for the active session.
 - Telegram `voice` messages are downloaded, transcribed, echoed back into the group, and then routed as normal prompts for the active session.
 - Folder navigation uses compact callback tokens rather than raw full paths in callback data, because Telegram callback payload size is limited.
@@ -99,6 +100,7 @@ SQLite currently stores:
 
 - The first prompt after `/new` starts a fresh Codex session.
 - Later prompts spawn a fresh `codex app-server` process and resume the stored provider thread ID.
+- If `thread/resume` fails with Codex's invalid-encrypted-content error, Atlas2 falls back to `thread/start`, persists the new provider thread ID, and surfaces the context reset back into Telegram.
 - The selected workspace directory becomes the Codex working directory.
 - Plan-mode turns are expressed by Atlas2 as plan-only prompt instructions plus a read-only app-server sandbox policy.
 - Atlas2 uses one live app-server process per active Telegram turn. The process stays alive while a turn is running or waiting for approval, then is shut down once the turn reaches a stable idle state.

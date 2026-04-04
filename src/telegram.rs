@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
@@ -7,6 +9,8 @@ use crate::{
 };
 
 const TELEGRAM_TEXT_LIMIT: usize = 4096;
+const TELEGRAM_MAX_RETRIES: usize = 5;
+const TELEGRAM_RETRY_PADDING_SECS: u64 = 1;
 
 #[derive(Clone)]
 pub struct TelegramClient {
@@ -173,26 +177,50 @@ impl TelegramClient {
     }
 
     async fn call<T: DeserializeOwned>(&self, method: &str, payload: &Value) -> AppResult<T> {
-        let response = self
-            .http
-            .post(format!("{}/{}", self.base_url, method))
-            .json(payload)
-            .send()
-            .await?;
+        let mut retries = 0;
+        loop {
+            let response = self
+                .http
+                .post(format!("{}/{}", self.base_url, method))
+                .json(payload)
+                .send()
+                .await?;
 
-        let envelope: TelegramEnvelope<T> = response.json().await?;
-        if !envelope.ok {
+            let envelope: TelegramEnvelope<T> = response.json().await?;
+            if envelope.ok {
+                return envelope.result.ok_or_else(|| {
+                    AppError::Telegram(format!("telegram method {method} returned no result"))
+                });
+            }
+
+            if let Some(retry_after_secs) = telegram_retry_after_seconds(&envelope) {
+                if retries < TELEGRAM_MAX_RETRIES {
+                    retries += 1;
+                    tracing::warn!(
+                        method,
+                        retry_after_secs,
+                        retries,
+                        "Telegram rate limited request; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_secs(
+                        retry_after_secs.saturating_add(TELEGRAM_RETRY_PADDING_SECS),
+                    ))
+                    .await;
+                    continue;
+                }
+            }
+
             return Err(AppError::Telegram(
                 envelope
                     .description
                     .unwrap_or_else(|| format!("telegram method {method} failed")),
             ));
         }
-
-        envelope.result.ok_or_else(|| {
-            AppError::Telegram(format!("telegram method {method} returned no result"))
-        })
     }
+}
+
+fn telegram_retry_after_seconds<T>(envelope: &TelegramEnvelope<T>) -> Option<u64> {
+    envelope.parameters.as_ref()?.retry_after
 }
 
 fn split_message_text(text: &str, parse_mode: Option<ParseMode>) -> Vec<String> {
@@ -274,6 +302,12 @@ struct TelegramEnvelope<T> {
     ok: bool,
     result: Option<T>,
     description: Option<String>,
+    parameters: Option<TelegramResponseParameters>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramResponseParameters {
+    retry_after: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -368,9 +402,11 @@ pub fn button(text: impl Into<String>, callback_data: impl Into<String>) -> Inli
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+
     use super::{
-        ParseMode, TELEGRAM_TEXT_LIMIT, TelegramFile, Update, split_message_text,
-        trim_message_text,
+        ParseMode, TELEGRAM_TEXT_LIMIT, TelegramEnvelope, TelegramFile, Update, split_message_text,
+        telegram_retry_after_seconds, trim_message_text,
     };
 
     #[test]
@@ -431,5 +467,21 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0], trim_message_text(&text, Some(ParseMode::Html)));
         assert!(chunks[0].chars().count() <= TELEGRAM_TEXT_LIMIT);
+    }
+
+    #[test]
+    fn reads_retry_after_from_error_envelope() {
+        let envelope: TelegramEnvelope<Value> = serde_json::from_str(
+            r#"{
+                "ok": false,
+                "description": "Too Many Requests: retry after 12",
+                "parameters": {
+                    "retry_after": 12
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(telegram_retry_after_seconds(&envelope), Some(12));
     }
 }

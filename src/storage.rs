@@ -3,10 +3,10 @@ use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 
 use crate::{
     domain::{
-        ApprovalId, ApprovalStatus, ChatBinding, CodexThreadId, FolderBrowseState, PendingApproval,
-        PendingPlanFollowUp, PendingUserInput, PlanFollowUpId, PlanFollowUpStatus,
-        SessionBackend, SessionId, SessionRecord, SessionStatus, SessionSummary,
-        TelegramChatId, TelegramUserId, UserInputRequestId, UserInputStatus, WorkspacePath,
+        ApprovalId, ApprovalStatus, ChatBinding, CodexThreadId, FolderBrowseState, HistoricProject,
+        PendingApproval, PendingPlanFollowUp, PendingUserInput, PlanFollowUpId, PlanFollowUpStatus,
+        SessionBackend, SessionId, SessionRecord, SessionStatus, SessionSummary, TelegramChatId,
+        TelegramUserId, UserInputRequestId, UserInputStatus, WorkspacePath,
     },
     error::{AppError, AppResult},
 };
@@ -316,6 +316,65 @@ impl Storage {
         .await?;
 
         rows.into_iter().map(map_session_summary).collect()
+    }
+
+    pub async fn list_historic_projects_for_chat(
+        &self,
+        chat_id: TelegramChatId,
+        limit: usize,
+    ) -> AppResult<Vec<HistoricProject>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT session_id, workspace_path
+            FROM (
+                SELECT session_id, workspace_path, created_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY workspace_path
+                           ORDER BY created_at DESC
+                       ) AS row_num
+                FROM sessions
+                WHERE chat_id = ?1
+            ) ranked
+            WHERE row_num = 1
+            ORDER BY created_at DESC
+            LIMIT ?2
+            "#,
+        )
+        .bind(chat_id.0)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(HistoricProject {
+                    source_session_id: SessionId(parse_uuid(&row.get::<String, _>("session_id"))?),
+                    workspace_path: WorkspacePath(row.get::<String, _>("workspace_path")),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn get_session_workspace_for_chat(
+        &self,
+        chat_id: TelegramChatId,
+        session_id: &SessionId,
+    ) -> AppResult<Option<WorkspacePath>> {
+        let row = sqlx::query(
+            r#"
+            SELECT workspace_path
+            FROM sessions
+            WHERE chat_id = ?1
+              AND session_id = ?2
+            LIMIT 1
+            "#,
+        )
+        .bind(chat_id.0)
+        .bind(session_id.0.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|row| WorkspacePath(row.get::<String, _>("workspace_path"))))
     }
 
     pub async fn set_folder_browse_state(&self, state: &FolderBrowseState) -> AppResult<()> {
@@ -780,9 +839,9 @@ mod tests {
     use super::Storage;
     use crate::domain::{
         ApprovalId, ApprovalStatus, ChatBinding, CodexThreadId, PendingApproval,
-        PendingPlanFollowUp, PendingUserInput, PlanFollowUpId, PlanFollowUpStatus,
-        SessionBackend, SessionId, SessionRecord, SessionStatus, TelegramChatId, UserInputAnswer,
-        UserInputOption, UserInputQuestion, UserInputRequestId, UserInputStatus, WorkspacePath,
+        PendingPlanFollowUp, PendingUserInput, PlanFollowUpId, PlanFollowUpStatus, SessionBackend,
+        SessionId, SessionRecord, SessionStatus, TelegramChatId, UserInputAnswer, UserInputOption,
+        UserInputQuestion, UserInputRequestId, UserInputStatus, WorkspacePath,
     };
     use std::collections::HashMap;
 
@@ -1100,5 +1159,114 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(expired.status, PlanFollowUpStatus::Expired);
+    }
+
+    #[tokio::test]
+    async fn lists_historic_projects_per_chat_by_recency_and_dedupes_paths() {
+        let storage = Storage::connect("sqlite::memory:").await.unwrap();
+        let chat_id = TelegramChatId(30);
+        let now = Utc::now();
+        let workspace_a = WorkspacePath("/tmp/project-a".into());
+        let workspace_b = WorkspacePath("/tmp/project-b".into());
+
+        storage
+            .insert_session(&SessionRecord {
+                session_id: SessionId::new(),
+                chat_id,
+                workspace_path: workspace_a.clone(),
+                backend: SessionBackend::AppServer,
+                provider_thread_id: None,
+                resume_cursor_json: None,
+                status: SessionStatus::Ready,
+                last_error: None,
+                created_at: now - chrono::Duration::minutes(5),
+                updated_at: now - chrono::Duration::minutes(5),
+            })
+            .await
+            .unwrap();
+        storage
+            .insert_session(&SessionRecord {
+                session_id: SessionId::new(),
+                chat_id,
+                workspace_path: workspace_b.clone(),
+                backend: SessionBackend::AppServer,
+                provider_thread_id: None,
+                resume_cursor_json: None,
+                status: SessionStatus::Ready,
+                last_error: None,
+                created_at: now - chrono::Duration::minutes(3),
+                updated_at: now - chrono::Duration::minutes(3),
+            })
+            .await
+            .unwrap();
+        storage
+            .insert_session(&SessionRecord {
+                session_id: SessionId::new(),
+                chat_id,
+                workspace_path: workspace_a.clone(),
+                backend: SessionBackend::AppServer,
+                provider_thread_id: None,
+                resume_cursor_json: None,
+                status: SessionStatus::Ready,
+                last_error: None,
+                created_at: now - chrono::Duration::minutes(1),
+                updated_at: now - chrono::Duration::minutes(1),
+            })
+            .await
+            .unwrap();
+        storage
+            .insert_session(&SessionRecord {
+                session_id: SessionId::new(),
+                chat_id: TelegramChatId(31),
+                workspace_path: WorkspacePath("/tmp/other-chat".into()),
+                backend: SessionBackend::AppServer,
+                provider_thread_id: None,
+                resume_cursor_json: None,
+                status: SessionStatus::Ready,
+                last_error: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+
+        let historic = storage
+            .list_historic_projects_for_chat(chat_id, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(historic.len(), 2);
+        assert_eq!(historic[0].workspace_path, workspace_a);
+        assert_eq!(historic[1].workspace_path, workspace_b);
+    }
+
+    #[tokio::test]
+    async fn gets_session_workspace_only_for_matching_chat() {
+        let storage = Storage::connect("sqlite::memory:").await.unwrap();
+        let session = SessionRecord {
+            session_id: SessionId::new(),
+            chat_id: TelegramChatId(40),
+            workspace_path: WorkspacePath("/tmp/project".into()),
+            backend: SessionBackend::AppServer,
+            provider_thread_id: None,
+            resume_cursor_json: None,
+            status: SessionStatus::Ready,
+            last_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        storage.insert_session(&session).await.unwrap();
+
+        let matching = storage
+            .get_session_workspace_for_chat(session.chat_id, &session.session_id)
+            .await
+            .unwrap();
+        let mismatched = storage
+            .get_session_workspace_for_chat(TelegramChatId(41), &session.session_id)
+            .await
+            .unwrap();
+
+        assert_eq!(matching, Some(WorkspacePath("/tmp/project".into())));
+        assert_eq!(mismatched, None);
     }
 }

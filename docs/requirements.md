@@ -12,7 +12,8 @@
 - The primary interface is a Telegram group.
 - The bot must be added to the group and group admins are the only users allowed to create sessions or resolve approvals.
 - `/start` and `/help` show available commands.
-- `/new` starts a folder-selection flow inside the current group.
+- `/new` first shows historic project buttons (per group), plus an `Add new project` button.
+- Tapping `Add new project` starts the folder-selection flow inside the current group.
 - `/sessions` lists all known sessions globally, including the group and workspace bound to each.
 - `/plan <prompt>` runs a plan-only Codex turn for the current session.
 - Any non-command text in a group with an active session is treated as a prompt for Codex.
@@ -22,7 +23,7 @@
 ## Folder Selection
 
 - A session must never start without an explicit validated working directory.
-- Folder selection happens inside Telegram through inline buttons.
+- Folder selection and historic-project reuse both happen inside Telegram through inline buttons.
 - The folder browser starts at `/`.
 - Users can navigate down into directories, move up to the parent directory, cancel the flow, or select the current directory.
 - Callback payloads must stay within Telegram limits; folder browsing must not rely on raw absolute paths inside callback data.
@@ -35,7 +36,8 @@
 - Atlas2 uses the local `codex` binary on the host machine.
 - A fresh session starts on the first prompt after `/new`.
 - Follow-up prompts resume the stored Codex provider thread through `codex app-server`.
-- New Atlas2 sessions should use `codex app-server --session-source cli` so Telegram-originated work is resumable from normal Codex CLI history.
+- If the stored provider thread cannot be resumed because Codex reports invalid encrypted content, Atlas2 must start a fresh provider thread, replace the stored thread ID, and tell Telegram that prior conversation context was lost.
+- New Atlas2 sessions should use `codex app-server` so Telegram-originated work is resumable through the app-server thread flow.
 - Codex runs with the selected workspace as its working directory.
 - Plan-mode turns must always be available through Telegram and must be routed as read-only planning requests rather than normal execution turns.
 - When a plan-mode turn finishes with a complete proposed plan, Telegram must offer follow-up actions to implement the plan or refine it.
